@@ -1,0 +1,2673 @@
+"""Data coordinator for Dominion SC integration."""
+
+from __future__ import annotations
+
+from dataclasses import dataclass
+from datetime import UTC, date, datetime, time, timedelta
+import logging
+import re
+from typing import Any
+from zoneinfo import ZoneInfo
+
+from homeassistant.config_entries import ConfigEntry
+from homeassistant.core import HomeAssistant
+from homeassistant.helpers.storage import Store
+from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
+
+# Dominion SC Bidgely timestamps are Eastern local wall-clock values.
+_DEFAULT_UTILITY_TZ = ZoneInfo("America/New_York")
+
+from .const import (
+    CONF_BACKFILL_CYCLES_TARGET,
+    CONF_DAILY_ELECTRIC_CATCHUP,
+    CONF_DAILY_LOOKBACK_DAYS,
+    CONF_ENABLE_DAILY_STATISTICS,
+    CONF_ENABLE_HOURLY_STATISTICS,
+    CONF_ENABLE_MONTHLY_STATISTICS,
+    CONF_INTERVAL_LOOKBACK_HOURS,
+    CONF_PASSWORD,
+    CONF_POLL_MINUTES,
+    CONF_TFA_TOKEN,
+    CONF_USERNAME,
+    CONF_VERIFY_SSL,
+    DEFAULT_BACKFILL_CYCLES_TARGET,
+    DEFAULT_CATCHUP_HOURLY_DAYS,
+    DEFAULT_DAILY_ELECTRIC_CATCHUP,
+    DEFAULT_DAILY_LOOKBACK_DAYS,
+    DEFAULT_ENABLE_DAILY_STATISTICS,
+    DEFAULT_ENABLE_HOURLY_STATISTICS,
+    DEFAULT_ENABLE_MONTHLY_STATISTICS,
+    DEFAULT_INTERVAL_LOOKBACK_HOURS,
+    DEFAULT_POLL_MINUTES,
+    DEFAULT_VERIFY_SSL,
+    DOMAIN,
+    STORE_KEY_PREFIX,
+    STORE_VERSION,
+    TOTAL_ELECTRIC_COST,
+    TOTAL_ELECTRIC_KWH,
+    TOTAL_GAS_COST,
+    TOTAL_GAS_FT3,
+)
+from .dominion_sc_client import DominionSCClient
+
+_LOGGER = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class BillingCycle:
+    start: date
+    end: date
+
+    @property
+    def key(self) -> str:
+        return f"{self.start.isoformat()}|{self.end.isoformat()}"
+
+
+class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
+    """Coordinate Dominion SC data fetches and persistent synthetic totals."""
+
+    config_entry: ConfigEntry
+
+    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
+        self.hass = hass
+        self.config_entry = entry
+
+        poll_minutes = int(entry.options.get(CONF_POLL_MINUTES, entry.data.get(CONF_POLL_MINUTES, DEFAULT_POLL_MINUTES)))
+        update_interval = timedelta(minutes=max(1, poll_minutes))
+
+        super().__init__(
+            hass,
+            _LOGGER,
+            name=f"{DOMAIN}_{entry.entry_id}",
+            update_interval=update_interval,
+        )
+
+        verify_ssl = bool(entry.data.get(CONF_VERIFY_SSL, DEFAULT_VERIFY_SSL))
+        self._client = DominionSCClient(verify_ssl=verify_ssl)
+        self._store = Store[dict[str, Any]](hass, STORE_VERSION, f"{STORE_KEY_PREFIX}{entry.entry_id}")
+        self._state: dict[str, Any] = self._default_state()
+        # Prevent overlapping backfill from button/service/initial/poll.
+        self._backfill_busy = False
+
+    async def async_setup(self) -> None:
+        """Load persisted state before first refresh."""
+        stored = await self._store.async_load()
+        if isinstance(stored, dict):
+            self._state = self._merge_state(stored)
+        # Recompute totals from any persisted ledgers if totals appear missing
+        # or were not written by older state formats. This ensures the
+        # synthetic cumulative totals are available immediately after a
+        # restart and avoid negative Energy Dashboard deltas when recorder
+        # statistics exist but in-memory totals are zero.
+        try:
+            self._recompute_totals_from_ledgers()
+        except Exception:  # defensive: do not let a recompute break startup
+            _LOGGER.debug("Could not recompute totals from ledgers on setup", exc_info=True)
+
+        # Stamp install time once so catch-up can bound itself to "since integrated"
+        self._ensure_installed_at()
+
+        # Upgrades from older builds: if historical cycles were already drained,
+        # do not re-run the one-time initial backfill on next startup.
+        if not self._state.get("initial_backfill_done"):
+            completed = self._state.get("backfill", {}).get("completed_cycles") or []
+            missing = self._state.get("backfill", {}).get("missing_cycles") or []
+            if completed and not missing:
+                self._state["initial_backfill_done"] = True
+
+        # One-time: Bidgely midnight intervalEnd was stored as the next calendar
+        # day and stats used UTC midnight (Energy bars at ~7–8pm prior evening).
+        self._migrate_day_ahead_and_utc_stats()
+
+        # Ensure backfill cycles are properly initialized after setup
+        self._initialize_backfill_cycles()
+        
+    @property
+    def totals(self) -> dict[str, float]:
+        return self._state["totals"]
+
+    @property
+    def backfill(self) -> dict[str, Any]:
+        return self._state["backfill"]
+
+    @property
+    def backfill_in_progress(self) -> bool:
+        """True while a backfill (one-cycle, full, or initial) is running."""
+        return bool(getattr(self, "_backfill_busy", False))
+
+    def _try_begin_backfill(self, reason: str) -> bool:
+        """Acquire the backfill busy flag. Returns False if already running."""
+        if self._backfill_busy:
+            _LOGGER.warning(
+                "Backfill already in progress for entry=%s; ignoring %s",
+                self.config_entry.entry_id,
+                reason,
+            )
+            return False
+        self._backfill_busy = True
+        # Notify button entities so they become unavailable.
+        try:
+            self.async_set_updated_data(dict(self.totals))
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not publish backfill-busy state", exc_info=True)
+        return True
+
+    def _end_backfill(self) -> None:
+        """Release the backfill busy flag and refresh entities."""
+        self._backfill_busy = False
+        try:
+            self.async_set_updated_data(dict(self.totals))
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not publish backfill-idle state", exc_info=True)
+
+    @property
+    def account_summary(self) -> dict[str, Any]:
+        """Return the latest fetched account/billing payload.
+
+        This value is populated during updates and may be an empty dict
+        if no data has been fetched yet.
+        """
+        return self._state.get("account_summary", {}) or {}
+
+    @property
+    def bill_projection(self) -> dict[str, Any]:
+        """Return the latest fetched bill projection payload."""
+        return self._state.get("bill_projection", {}) or {}
+
+    @property
+    def current_bill_summary(self) -> dict[str, Any]:
+        """Return the latest summarized current bill payload (bill_summary)."""
+        return self._state.get("current_bill_summary", {}) or {}
+
+    @property
+    def current_daily_usage(self) -> dict[str, Any]:
+        """Return the latest fetched current daily usage payload."""
+        return self._state.get("current_daily_usage", {}) or {}
+
+    @property
+    def backfill_cycles_target(self) -> int:
+        """Return the currently configured backfill cycles target."""
+        return int(
+            self.config_entry.options.get(
+                CONF_BACKFILL_CYCLES_TARGET,
+                self.config_entry.data.get(CONF_BACKFILL_CYCLES_TARGET, DEFAULT_BACKFILL_CYCLES_TARGET),
+            )
+        )
+
+    @property
+    def backfill_summary(self) -> dict[str, Any]:
+        """Compute a consistent backfill summary based on current target.
+
+        Returns a dict with:
+        - target: configured backfill cycles target
+        - eligible_keys: cycle keys eligible for the current target
+        - completed_cycles: all-time completed cycle keys (persistent)
+        - completed_in_scope: completed cycles that are in the current eligible set
+        - incomplete_cycles: eligible cycles that are NOT yet completed
+        """
+        target = self.backfill_cycles_target
+        eligible = self._build_recent_monthly_cycles(
+            now_date=datetime.now().date(), target=target
+        )
+        eligible_keys = [c.key for c in eligible]
+        all_completed = set(self.backfill.get("completed_cycles", []))
+
+        completed_in_scope = [k for k in eligible_keys if k in all_completed]
+        incomplete = [k for k in eligible_keys if k not in all_completed]
+
+        return {
+            "target": target,
+            "eligible_keys": eligible_keys,
+            "completed_cycles": sorted(all_completed),
+            "completed_in_scope": completed_in_scope,
+            "incomplete_cycles": incomplete,
+        }
+
+    @property
+    def current_billing_cycle(self) -> BillingCycle:
+        """Return current billing cycle using fetched projection/current payloads.
+
+        Prefer `bill_projection.billStartDateFormatted` / `billEndDateFormatted` (ISO)
+        or `billStartDate` / `billEndDate` (human) when available. Fall back to
+        current_daily_usage fields, then to month-start -> today.
+        """
+        bp = self._state.get("bill_projection") or {}
+        start = None
+        end = None
+
+        def _try_parse(s: str) -> date | None:
+            if not s:
+                return None
+            # Try ISO first
+            try:
+                return date.fromisoformat(s)
+            except Exception:
+                pass
+            # Try common human-readable format like 'Mar 9, 2026'
+            try:
+                return datetime.strptime(s, "%b %d, %Y").date()
+            except Exception:
+                return None
+
+        # Try bill_projection first
+        if isinstance(bp, dict):
+            sd = bp.get("billStartDateFormatted") or bp.get("billStartDate")
+            ed = bp.get("billEndDateFormatted") or bp.get("billEndDate")
+            start = _try_parse(sd) if sd else None
+            end = _try_parse(ed) if ed else None
+
+        # Debug: log what we found in bill_projection
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            try:
+                _LOGGER.debug(
+                    "Billing cycle source: bill_projection sd=%s ed=%s parsed_start=%s parsed_end=%s",
+                    bp.get("billStartDateFormatted") or bp.get("billStartDate"),
+                    bp.get("billEndDateFormatted") or bp.get("billEndDate"),
+                    start.isoformat() if start else None,
+                    end.isoformat() if end else None,
+                )
+            except Exception:
+                _LOGGER.debug("Billing cycle source: bill_projection present but could not log values")
+
+        # Fallback: current_daily_usage payload
+        if (not start or not end):
+            cd = self._state.get("current_daily_usage") or {}
+            sd = cd.get("billStartDateFormatted") or cd.get("billStartDate")
+            ed = cd.get("billEndDateFormatted") or cd.get("billEndDate")
+            if not start and sd:
+                start = _try_parse(sd)
+            if not end and ed:
+                end = _try_parse(ed)
+
+        # Debug: log what we found in current_daily_usage
+        if _LOGGER.isEnabledFor(logging.DEBUG):
+            try:
+                _LOGGER.debug(
+                    "Billing cycle source: current_daily_usage sd=%s ed=%s parsed_start=%s parsed_end=%s",
+                    cd.get("billStartDateFormatted") or cd.get("billStartDate"),
+                    cd.get("billEndDateFormatted") or cd.get("billEndDate"),
+                    start.isoformat() if start else None,
+                    end.isoformat() if end else None,
+                )
+            except Exception:
+                _LOGGER.debug("Billing cycle source: current_daily_usage present but could not log values")
+
+        if start and end:
+            if _LOGGER.isEnabledFor(logging.DEBUG):
+                _LOGGER.debug(
+                    "Resolved current billing cycle: start=%s end=%s",
+                    start.isoformat(), end.isoformat(),
+                )
+            return BillingCycle(start=start, end=end)
+
+        # Final fallback: month start to today (utility calendar)
+        now = self._utility_today()
+        start = date(now.year, now.month, 1)
+        return BillingCycle(start=start, end=now)
+
+    @property
+    def last_sync(self) -> str | None:
+        """Return ISO 8601 timestamp string for last successful sync, or None."""
+        return self._state.get("last_sync")
+
+    async def async_run_backfill(
+        self,
+        overwrite: bool = False,
+        cycle_key: str | None = None,
+        allow_initialize_missing: bool = False,
+    ) -> None:
+        """Manually process one backfill cycle."""
+        if not self._try_begin_backfill("manual one-cycle backfill"):
+            return
+        try:
+            await self._run_backfill_unlocked(
+                overwrite=overwrite,
+                cycle_key=cycle_key,
+                allow_initialize_missing=allow_initialize_missing,
+            )
+        finally:
+            self._end_backfill()
+
+    async def _run_backfill_unlocked(
+        self,
+        *,
+        overwrite: bool = False,
+        cycle_key: str | None = None,
+        allow_initialize_missing: bool = False,
+    ) -> None:
+        """One-cycle backfill body (caller must hold the busy lock)."""
+        _LOGGER.debug(
+            "Manual backfill requested: entry=%s overwrite=%s cycle_key=%s",
+            self.config_entry.entry_id,
+            overwrite,
+            cycle_key,
+        )
+        await self._ensure_authenticated()
+        # When triggered manually via the service/button, callers may choose
+        # whether to allow repopulating missing cycles. Pass the flag through
+        # to the processing routine.
+        await self._process_backfill(
+            overwrite=overwrite, cycle_key=cycle_key, allow_initialize_missing=allow_initialize_missing
+        )
+        await self._sync_external_statistics(force_rewrite=overwrite)
+        await self._sync_hourly_external_statistics(force_rewrite=overwrite)
+        await self._sync_monthly_external_statistics(force_rewrite=overwrite)
+        self._apply_monotonic_guard()
+        # Update last_sync because a manual backfill is a successful sync operation
+        self._set_last_sync()
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+        _LOGGER.debug("Manual backfill finished: entry=%s totals=%s", self.config_entry.entry_id, self.totals)
+
+    async def async_run_backfill_all(self, overwrite: bool = False) -> None:
+        """Manually process all incomplete backfill cycles."""
+        if not self._try_begin_backfill("manual full backfill"):
+            return
+        try:
+            await self._run_backfill_all_unlocked(overwrite=overwrite)
+        finally:
+            self._end_backfill()
+
+    async def _run_backfill_all_unlocked(self, *, overwrite: bool = False) -> None:
+        """Full backfill body (caller must hold the busy lock)."""
+        _LOGGER.debug(
+            "Manual full backfill requested: entry=%s overwrite=%s",
+            self.config_entry.entry_id,
+            overwrite,
+        )
+        await self._ensure_authenticated()
+
+        if not self._state["backfill"].get("missing_cycles"):
+            self._initialize_backfill_cycles()
+
+        while self._state["backfill"].get("missing_cycles"):
+            await self._process_backfill(overwrite=overwrite, allow_initialize_missing=False)
+
+        await self._sync_external_statistics(force_rewrite=overwrite)
+        await self._sync_hourly_external_statistics(force_rewrite=overwrite)
+        await self._sync_monthly_external_statistics(force_rewrite=overwrite)
+        self._apply_monotonic_guard()
+        self._set_last_sync()
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+        _LOGGER.debug("Manual full backfill finished: entry=%s totals=%s", self.config_entry.entry_id, self.totals)
+
+    async def async_rewrite_statistics(self) -> None:
+        """Rebuild recorder-backed sensor statistics and clean legacy external series."""
+        _LOGGER.debug("Manual statistics rewrite requested: entry=%s", self.config_entry.entry_id)
+        await self._clear_external_statistics()
+        await self._sync_external_statistics(force_rewrite=True)
+        await self._sync_hourly_external_statistics(force_rewrite=True)
+        await self._sync_monthly_external_statistics(force_rewrite=True)
+        # Update last_sync because rewriting statistics is an intentional sync operation
+        self._set_last_sync()
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+        _LOGGER.debug("Manual statistics rewrite finished: entry=%s", self.config_entry.entry_id)
+
+    async def async_maybe_run_initial_backfill(self) -> None:
+        """On first integration, drain the historical month-cycle backfill queue once.
+
+        Subsequent catch-up (button / daily) only fills from install → now and
+        does not re-queue completed historical cycles.
+        """
+        self._ensure_installed_at()
+        if self._state.get("initial_backfill_done"):
+            _LOGGER.debug(
+                "Initial backfill already completed for entry=%s",
+                self.config_entry.entry_id,
+            )
+            return
+        if not self._try_begin_backfill("initial historical backfill"):
+            return
+
+        _LOGGER.info(
+            "Starting one-time initial historical backfill for entry=%s",
+            self.config_entry.entry_id,
+        )
+        try:
+            await self._run_backfill_all_unlocked(overwrite=False)
+            # Also pull electricity from install → now so current cycle is filled.
+            await self.async_sync_electricity_catchup(full_since_install=True)
+            self._state["initial_backfill_done"] = True
+            await self._save_state()
+            _LOGGER.info(
+                "Initial historical backfill finished for entry=%s",
+                self.config_entry.entry_id,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            # Leave initial_backfill_done=False so the next daily/poll can retry.
+            _LOGGER.warning(
+                "Initial backfill failed for entry=%s: %s",
+                self.config_entry.entry_id,
+                err,
+            )
+        finally:
+            self._end_backfill()
+
+    async def async_sync_electricity_catchup(self, *, full_since_install: bool = True) -> None:
+        """Fill electricity (and cost) from install/watermark → now without deep re-backfill.
+
+        ``full_since_install=True`` (button): daily rows from installed_at → today,
+        plus a capped hourly window.
+        ``full_since_install=False`` (daily schedule): only from catch-up watermark
+        minus lookback → today.
+        """
+        await self._ensure_authenticated()
+        self._ensure_installed_at()
+
+        today = self._utility_today()
+        installed = self._installed_at_date()
+        lookback = int(
+            self.config_entry.options.get(
+                CONF_DAILY_LOOKBACK_DAYS,
+                self.config_entry.data.get(CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS),
+            )
+        )
+
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None},
+        )
+        if full_since_install:
+            start = installed
+        else:
+            watermark_raw = catchup.get("watermark_date")
+            try:
+                watermark = date.fromisoformat(str(watermark_raw)) if watermark_raw else installed
+            except ValueError:
+                watermark = installed
+            start = max(installed, watermark - timedelta(days=max(1, lookback)))
+
+        if start > today:
+            start = today
+
+        _LOGGER.info(
+            "Electricity catch-up: entry=%s full_since_install=%s start=%s end=%s",
+            self.config_entry.entry_id,
+            full_since_install,
+            start.isoformat(),
+            today.isoformat(),
+        )
+
+        await self._catchup_electric_daily(start, today)
+        await self._catchup_electric_intervals(start, today)
+        await self._monthly_reconcile()
+        await self._sync_external_statistics(force_rewrite=False)
+        await self._sync_hourly_external_statistics(force_rewrite=False)
+        await self._sync_monthly_external_statistics(force_rewrite=False)
+        self._apply_monotonic_guard()
+
+        catchup["last_run"] = self._utility_now().isoformat()
+        catchup["watermark_date"] = today.isoformat()
+        self._set_last_sync()
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+        _LOGGER.debug(
+            "Electricity catch-up finished: entry=%s watermark=%s",
+            self.config_entry.entry_id,
+            catchup["watermark_date"],
+        )
+
+    async def async_recalculate_backfill_target(self, new_target: int) -> None:
+        """Recalculate missing backfill cycles when the target changes.
+
+        If the target increased, newly eligible cycles that are not already
+        completed are added to missing_cycles.  If decreased, cycles beyond
+        the new target that have not yet been backfilled are removed.
+        """
+        old_target = int(
+            self.config_entry.data.get(
+                CONF_BACKFILL_CYCLES_TARGET, DEFAULT_BACKFILL_CYCLES_TARGET
+            )
+        )
+        # Also check what was previously stored in state
+        state_target = self._state.get("backfill_cycles_target", old_target)
+        if new_target == state_target:
+            _LOGGER.debug("Backfill target unchanged at %d", state_target)
+            return
+
+        _LOGGER.info(
+            "Backfill target changed: %d -> %d, recalculating missing cycles",
+            state_target,
+            new_target,
+        )
+
+        # Compute eligible cycles for the new target
+        all_eligible = self._build_recent_monthly_cycles(
+            now_date=datetime.now().date(), target=new_target
+        )
+        all_eligible_keys = [c.key for c in all_eligible]
+
+        completed = set(self._state["backfill"].get("completed_cycles", []))
+        new_missing = [k for k in all_eligible_keys if k not in completed]
+
+        old_missing = self._state["backfill"].get("missing_cycles", [])
+        _LOGGER.debug(
+            "Backfill recalc: eligible=%d, completed=%d, "
+            "old_missing=%d, new_missing=%d",
+            len(all_eligible_keys),
+            len(completed),
+            len(old_missing),
+            len(new_missing),
+        )
+
+        self._state["backfill"]["missing_cycles"] = new_missing
+        self._state["backfill_cycles_target"] = new_target
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+
+    async def _async_update_data(self) -> dict[str, float]:
+        try:
+            await self._ensure_authenticated()
+            # Fetch account and billing data used by informational sensors.
+            # Use the executor because the client uses blocking requests.
+            try:
+                account_summary = await self.hass.async_add_executor_job(self._client.get_account_summary)
+                self._state["account_summary"] = account_summary
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Could not fetch account_summary: %s", err)
+
+            try:
+                current_daily = await self.hass.async_add_executor_job(self._client.get_current_daily_usage)
+                # store entire current_daily payload and the summarized bill_summary
+                self._state["current_daily_usage"] = current_daily
+                self._state["current_bill_summary"] = current_daily.get("bill_summary", {})
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Could not fetch current_daily_usage: %s", err)
+
+            try:
+                bill_projection = await self.hass.async_add_executor_job(self._client.get_bill_projection)
+                self._state["bill_projection"] = bill_projection
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning("Could not fetch bill_projection: %s", err)
+            utility_now = self._utility_now()
+            await self._process_intervals(utility_now)
+            await self._daily_reconcile(utility_now.date())
+            await self._monthly_reconcile()
+            # Process at most one missing backfill cycle per scheduled update
+            # (initial install also drains the full queue via async_maybe_run_initial_backfill).
+            # Hold the busy lock so the Run Backfill button stays unavailable.
+            if self._try_begin_backfill("scheduled one-cycle backfill"):
+                try:
+                    await self._process_backfill(overwrite=False)
+                finally:
+                    self._end_backfill()
+            # else: a manual/initial backfill is already running; skip this poll's cycle
+            # One-time migration: clear auto-compiled recorder rows that
+            # conflict with our imported statistics after state_class removal.
+            force_rewrite = self._check_statistics_migration()
+            # One-time fix: re-create external statistics with proper unit_class
+            force_rewrite = self._check_unit_class_fix() or force_rewrite
+            force_rewrite = bool(self._state.pop("_force_stats_rewrite", False)) or force_rewrite
+            await self._sync_external_statistics(force_rewrite=force_rewrite)
+            await self._sync_hourly_external_statistics(force_rewrite=force_rewrite)
+            await self._sync_monthly_external_statistics(force_rewrite=force_rewrite)
+            # Cadence:
+            # - hourly/daily series: commit each completed hour
+            # - monthly series: commit only after a month ends
+            # - once-per-day catch-up still fills gaps since install watermark
+            await self._maybe_hourly_electric_catchup()
+            await self._maybe_monthly_electric_catchup()
+            await self._maybe_daily_electric_catchup()
+            self._apply_monotonic_guard()
+            # Update last_sync timestamp for scheduled/automatic update
+            self._set_last_sync()
+            await self._save_state()
+            return dict(self.totals)
+        except Exception as err:  # pylint: disable=broad-except
+            raise UpdateFailed(str(err)) from err
+
+    async def _clear_external_statistics(self) -> None:
+        """Clear all legacy statistic IDs (both old dominionsc:entry_* and sensor.* formats)."""
+        try:
+            from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Recorder unavailable while clearing external stats: %s", err)
+            return
+
+        statistic_ids = [
+            stat_id
+            for stat_id in (
+                self.get_legacy_external_statistic_id(TOTAL_ELECTRIC_KWH),
+                self.get_legacy_external_statistic_id(TOTAL_GAS_FT3),
+                self.get_statistic_id(TOTAL_ELECTRIC_KWH),
+                self.get_statistic_id(TOTAL_GAS_FT3),
+                self.get_statistic_id(TOTAL_ELECTRIC_COST),
+                self.get_statistic_id(TOTAL_GAS_COST),
+                self.get_hourly_statistic_id(TOTAL_ELECTRIC_KWH),
+                self.get_hourly_statistic_id(TOTAL_GAS_FT3),
+                self.get_hourly_statistic_id(TOTAL_ELECTRIC_COST),
+                self.get_hourly_statistic_id(TOTAL_GAS_COST),
+                self.get_monthly_statistic_id(TOTAL_ELECTRIC_KWH),
+                self.get_monthly_statistic_id(TOTAL_GAS_FT3),
+                self.get_monthly_statistic_id(TOTAL_ELECTRIC_COST),
+                self.get_monthly_statistic_id(TOTAL_GAS_COST),
+            )
+            if stat_id
+        ]
+        # Also clear old sensor.* based statistic IDs that conflicted with
+        # the recorder's auto-compilation (the previous architecture).
+        statistic_ids.extend(self.get_legacy_sensor_statistic_ids())
+
+        if not statistic_ids:
+            return
+
+        recorder = get_instance(self.hass)
+        recorder.async_clear_statistics(statistic_ids)
+        _LOGGER.info("Cleared legacy/external statistic IDs: %s", statistic_ids)
+
+    def get_statistic_id(self, total_key: str) -> str | None:
+        """Return external daily statistic_id for Energy Dashboard historical data.
+
+        Uses the 'dominionsc' source prefix so these statistics are completely
+        separate from the HA recorder's auto-compiled entity statistics.  This
+        avoids conflicts where the recorder writes sum=0 rows after restarts
+        that create negative deltas in the Energy Dashboard.
+
+        External statistics appear in the Energy Dashboard picker under
+        'External statistics' and can be selected for grid/gas/cost tracking.
+        """
+        mapping = {
+            TOTAL_ELECTRIC_KWH: f"{DOMAIN}:electric_cumulative_consumption",
+            TOTAL_GAS_FT3: f"{DOMAIN}:gas_cumulative_consumption",
+            TOTAL_ELECTRIC_COST: f"{DOMAIN}:electric_cumulative_cost",
+            TOTAL_GAS_COST: f"{DOMAIN}:gas_cumulative_cost",
+        }
+        return mapping.get(total_key)
+
+    def get_hourly_statistic_id(self, total_key: str) -> str | None:
+        """Return external hourly statistic_id (interval data aggregated to hours)."""
+        mapping = {
+            TOTAL_ELECTRIC_KWH: f"{DOMAIN}:electric_hourly_consumption",
+            TOTAL_GAS_FT3: f"{DOMAIN}:gas_hourly_consumption",
+            TOTAL_ELECTRIC_COST: f"{DOMAIN}:electric_hourly_cost",
+            TOTAL_GAS_COST: f"{DOMAIN}:gas_hourly_cost",
+        }
+        return mapping.get(total_key)
+
+    def get_monthly_statistic_id(self, total_key: str) -> str | None:
+        """Return external monthly statistic_id (Bidgely mode=year buckets)."""
+        mapping = {
+            TOTAL_ELECTRIC_KWH: f"{DOMAIN}:electric_monthly_consumption",
+            TOTAL_GAS_FT3: f"{DOMAIN}:gas_monthly_consumption",
+            TOTAL_ELECTRIC_COST: f"{DOMAIN}:electric_monthly_cost",
+            TOTAL_GAS_COST: f"{DOMAIN}:gas_monthly_cost",
+        }
+        return mapping.get(total_key)
+
+    def get_legacy_external_statistic_id(self, total_key: str) -> str | None:
+        """Return previous custom external statistic_id used by older integration versions."""
+        entry_id = re.sub(r"[^a-z0-9_]", "_", str(self.config_entry.entry_id).lower())
+        mapping = {
+            TOTAL_ELECTRIC_KWH: f"{DOMAIN}:{entry_id}_electric_consumption",
+            TOTAL_GAS_FT3: f"{DOMAIN}:{entry_id}_gas_consumption",
+        }
+        return mapping.get(total_key)
+
+    def get_legacy_sensor_statistic_ids(self) -> list[str]:
+        """Return previous sensor.* statistic_ids that conflicted with recorder.
+
+        These were used before switching to external statistics and caused
+        negative deltas because the HA recorder also auto-compiled into them.
+        """
+        base = "dominion_sc_energy"
+        return [
+            f"sensor.{base}_electric_cumulative_consumption",
+            f"sensor.{base}_gas_cumulative_consumption",
+            f"sensor.{base}_electric_cumulative_cost",
+            f"sensor.{base}_gas_cumulative_cost",
+        ]
+
+    def _option_bool(self, key: str, default: bool) -> bool:
+        """Read a boolean from options, falling back to entry data then default."""
+        return bool(
+            self.config_entry.options.get(
+                key,
+                self.config_entry.data.get(key, default),
+            )
+        )
+
+    def _hourly_statistics_enabled(self) -> bool:
+        return self._option_bool(
+            CONF_ENABLE_HOURLY_STATISTICS, DEFAULT_ENABLE_HOURLY_STATISTICS
+        )
+
+    def _daily_statistics_enabled(self) -> bool:
+        return self._option_bool(
+            CONF_ENABLE_DAILY_STATISTICS, DEFAULT_ENABLE_DAILY_STATISTICS
+        )
+
+    def _monthly_statistics_enabled(self) -> bool:
+        return self._option_bool(
+            CONF_ENABLE_MONTHLY_STATISTICS, DEFAULT_ENABLE_MONTHLY_STATISTICS
+        )
+
+    async def _sync_external_statistics(self, *, force_rewrite: bool = False) -> None:
+        """Import historical daily usage into external dominionsc:* statistics with day timestamps.
+
+        Uses external statistics (source='dominionsc') to avoid conflicts with
+        the HA recorder's auto-compiled entity statistics. The recorder compiles
+        hourly statistics for sensors with state_class and can reset sum=0 after
+        restarts; external statistics are completely independent of that process.
+        """
+        if not self._daily_statistics_enabled():
+            _LOGGER.debug("Daily statistics sync skipped: disabled in options")
+            return
+        try:
+            from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
+            from homeassistant.components.recorder.statistics import (  # pylint: disable=import-outside-toplevel
+                StatisticData,
+                StatisticMetaData,
+                StatisticMeanType,
+                async_add_external_statistics,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Recorder statistics import unavailable: %s", err)
+            return
+
+        statistics_state = self._state.setdefault("statistics_import", {"electric": [], "gas": []})
+        fuel_config: list[tuple[str, str, str, str, str | None]] = [
+            # (series_key, total_key, unit, ledger_name, unit_class)
+            ("electric", TOTAL_ELECTRIC_KWH, "kWh", "daily_ledger", "energy"),
+            ("gas", TOTAL_GAS_FT3, "ft³", "daily_ledger", "volume"),
+            ("electric_cost", TOTAL_ELECTRIC_COST, "$", "daily_cost_ledger", None),
+            ("gas_cost", TOTAL_GAS_COST, "$", "daily_cost_ledger", None),
+        ]
+
+        for series_key, total_key, unit, ledger_name, unit_class in fuel_config:
+            # For cost series, the ledger keys use "electric|date" / "gas|date" (no "_cost" prefix)
+            fuel_prefix = series_key.replace("_cost", "")
+            imported_days_raw = statistics_state.setdefault(series_key, [])
+            imported_days = set(imported_days_raw if isinstance(imported_days_raw, list) else [])
+
+            daily_points: list[tuple[date, float]] = []
+            today = self._utility_today()
+
+            for key, value in self._state.get(ledger_name, {}).items():
+                if not isinstance(key, str) or not key.startswith(f"{fuel_prefix}|"):
+                    continue
+                day_str = key.split("|", 1)[1]
+                try:
+                    day = date.fromisoformat(day_str)
+                except ValueError:
+                    continue
+
+                consumption = max(float(value), 0.0) if value is not None else 0.0
+
+                # Skip future dates. Today is allowed so the daily Energy series
+                # can update at each completed hour (progressive in-day total).
+                if day > today:
+                    _LOGGER.debug(
+                        "Statistics sync filtering future date: %s=%s (%s)",
+                        key, consumption, series_key,
+                    )
+                    continue
+
+                # Zeros stay null — never import a 0 statistic point.
+                if consumption == 0.0:
+                    _LOGGER.debug(
+                        "Statistics sync filtering zero row (null): %s (%s)",
+                        key,
+                        series_key,
+                    )
+                    continue
+
+                daily_points.append((day, consumption))
+
+            if not daily_points:
+                _LOGGER.debug("Statistics sync skipped for %s: no daily points", series_key)
+                continue
+
+            daily_points.sort(key=lambda item: item[0])
+            # Build a set of available day strings from the ledger points so
+            # we can detect when previously imported days are missing from
+            # the current ledger. If any previously imported day is not
+            # present, force a rewrite to avoid importing a smaller
+            # cumulative sequence (which would create negative deltas).
+            point_day_set = {d.isoformat() for d, _ in daily_points}
+            running_sum = 0.0
+            to_import: list[StatisticData] = []
+
+            statistic_id = self.get_statistic_id(total_key)
+            if not statistic_id:
+                continue
+
+            _LOGGER.debug(
+                "Statistics sync start: series=%s force_rewrite=%s points=%s imported_days=%s statistic_id=%s",
+                series_key,
+                force_rewrite,
+                len(daily_points),
+                len(imported_days),
+                statistic_id,
+            )
+
+            rewrite_for_fuel = force_rewrite
+            if not rewrite_for_fuel and imported_days:
+                try:
+                    max_imported_day = max(date.fromisoformat(day_key) for day_key in imported_days)
+                except ValueError:
+                    max_imported_day = None
+                if max_imported_day is not None:
+                    has_older_new_day = any(
+                        point_day < max_imported_day and point_day.isoformat() not in imported_days
+                        for point_day, _ in daily_points
+                    )
+                    if has_older_new_day:
+                        rewrite_for_fuel = True
+                        _LOGGER.info(
+                            "Statistics sync forcing rewrite for %s due to newly discovered older days",
+                            series_key,
+                        )
+                # If any previously imported day is missing from the ledger
+                # we must force a rewrite. This can happen after state restore
+                # / reboot if the ledger was changed or filtered differently
+                # and helps avoid importing cumulative values that are lower
+                # than what was previously written to recorder.
+                if any(day_key not in point_day_set for day_key in imported_days):
+                    rewrite_for_fuel = True
+                    _LOGGER.info(
+                        "Statistics sync forcing rewrite for %s because previously imported days are missing from ledger",
+                        series_key,
+                    )
+
+            # Detect cumulative sum drift: if ledger values for previously-
+            # imported days changed (e.g. daily_reconcile overwrites with
+            # updated API data), the running_sum at max_imported_day will
+            # differ from what was written to the recorder last time. Appending
+            # new points with shifted sums creates negative deltas in the
+            # Energy Dashboard. Force a rewrite to correct the full series.
+            if not rewrite_for_fuel and imported_days:
+                max_imported_iso = max(imported_days)
+                precompute_sum = 0.0
+                for day, consumption in daily_points:
+                    precompute_sum += consumption
+                    if day.isoformat() == max_imported_iso:
+                        break
+                stored_sum_key = f"{series_key}_sum_at_max"
+                stored_max_sum = statistics_state.get(stored_sum_key)
+                if stored_max_sum is not None and abs(precompute_sum - stored_max_sum) > 0.001:
+                    rewrite_for_fuel = True
+                    _LOGGER.info(
+                        "Statistics sync forcing rewrite for %s: cumulative sum at max imported day "
+                        "changed (stored=%.3f current=%.3f) — ledger values were updated overnight",
+                        series_key, stored_max_sum, precompute_sum,
+                    )
+
+            if rewrite_for_fuel:
+                imported_days.clear()
+                recorder = get_instance(self.hass)
+                # NOTE: Despite the async-style name, this is not an awaitable coroutine
+                # in current HA recorder API. Do not add `await` here.
+                recorder.async_clear_statistics([statistic_id])
+                _LOGGER.info("Cleared existing statistics for %s", statistic_id)
+
+            for day, consumption in daily_points:
+                running_sum += consumption
+                day_key = day.isoformat()
+                if day_key in imported_days:
+                    continue
+                to_import.append(
+                    StatisticData(
+                        start=self._local_midnight(day),
+                        state=running_sum,
+                        sum=running_sum,
+                    )
+                )
+                imported_days.add(day_key)
+
+            if not to_import:
+                # Even when nothing new to import, update the stored sum so
+                # drift detection stays accurate as ledger values settle.
+                if imported_days:
+                    statistics_state[f"{series_key}_sum_at_max"] = running_sum
+                _LOGGER.debug("Statistics sync no-op for %s: nothing new to import", series_key)
+                continue
+
+            # Label explicitly as Daily so Energy Dashboard shows Hourly/Daily/Monthly.
+            friendly_label = series_key.replace("_", " ").title()
+            metadata = StatisticMetaData(
+                has_mean=False,
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=f"Dominion SC Daily {friendly_label}",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class=unit_class,
+                unit_of_measurement=unit,
+            )
+
+            # NOTE: Despite the async-style name, these are not awaitable coroutines
+            # in current HA recorder API. Do not add `await` here.
+            # For external statistics, always use async_add_external_statistics.
+            # The rewrite path already cleared existing rows above via
+            # recorder.async_clear_statistics, so this inserts fresh data.
+            async_add_external_statistics(self.hass, metadata, to_import)
+
+            statistics_state[series_key] = sorted(imported_days)
+            # Store the running_sum at the max imported day so we can detect
+            # cumulative sum drift on the next run (ledger value changes that
+            # would produce negative deltas if we just append).
+            statistics_state[f"{series_key}_sum_at_max"] = running_sum
+            _LOGGER.debug(
+                "Statistics sync complete: series=%s mode=%s imported=%s tracked_days=%s sum_at_max=%.3f",
+                series_key,
+                "rewrite" if rewrite_for_fuel else "append",
+                len(to_import),
+                len(statistics_state[series_key]),
+                running_sum,
+            )
+
+    async def _sync_hourly_external_statistics(self, *, force_rewrite: bool = False) -> None:
+        """Import interval ledger rows as hour-aligned external statistics."""
+        if not self._hourly_statistics_enabled():
+            _LOGGER.debug("Hourly statistics sync skipped: disabled in options")
+            return
+        try:
+            from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
+            from homeassistant.components.recorder.statistics import (  # pylint: disable=import-outside-toplevel
+                StatisticData,
+                StatisticMetaData,
+                StatisticMeanType,
+                async_add_external_statistics,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Recorder hourly statistics import unavailable: %s", err)
+            return
+
+        statistics_state = self._state.setdefault("hourly_statistics_import", {})
+        fuel_config: list[tuple[str, str, str, str, str | None]] = [
+            ("electric", TOTAL_ELECTRIC_KWH, "kWh", "interval_ledger", "energy"),
+            ("gas", TOTAL_GAS_FT3, "ft³", "interval_ledger", "volume"),
+            ("electric_cost", TOTAL_ELECTRIC_COST, "$", "interval_cost_ledger", None),
+            ("gas_cost", TOTAL_GAS_COST, "$", "interval_cost_ledger", None),
+        ]
+
+        # Only commit completed hours — never the in-progress hour (utility local).
+        local_tz = self._local_tz()
+        now_local = self._utility_now()
+        current_hour_start = now_local.replace(minute=0, second=0, microsecond=0)
+
+        for series_key, total_key, unit, ledger_name, unit_class in fuel_config:
+            fuel_prefix = series_key.replace("_cost", "")
+            statistic_id = self.get_hourly_statistic_id(total_key)
+            if not statistic_id:
+                continue
+
+            hourly_points = self._aggregate_interval_ledger_to_hours(
+                self._state.get(ledger_name, {}) or {},
+                fuel_prefix=fuel_prefix,
+                tz=local_tz,
+            )
+            completed_points = [
+                (hour_start, consumption)
+                for hour_start, consumption in hourly_points
+                if hour_start < current_hour_start and consumption > 0.0
+            ]
+            if not completed_points:
+                _LOGGER.debug(
+                    "Hourly statistics sync skipped for %s: no completed hours yet",
+                    series_key,
+                )
+                continue
+
+            imported_raw = statistics_state.setdefault(series_key, [])
+            imported_hours = set(imported_raw if isinstance(imported_raw, list) else [])
+            point_hour_set = {dt.isoformat() for dt, _ in completed_points}
+            rewrite_for_fuel = force_rewrite
+            if not rewrite_for_fuel and imported_hours:
+                if any(key not in point_hour_set for key in imported_hours):
+                    rewrite_for_fuel = True
+                else:
+                    max_imported = max(imported_hours)
+                    precompute_sum = 0.0
+                    for hour_start, consumption in completed_points:
+                        precompute_sum += consumption
+                        if hour_start.isoformat() == max_imported:
+                            break
+                    stored_max = statistics_state.get(f"{series_key}_sum_at_max")
+                    if stored_max is not None and abs(precompute_sum - float(stored_max)) > 0.001:
+                        rewrite_for_fuel = True
+
+            if rewrite_for_fuel:
+                imported_hours.clear()
+                get_instance(self.hass).async_clear_statistics([statistic_id])
+                _LOGGER.info("Cleared existing hourly statistics for %s", statistic_id)
+
+            running_sum = 0.0
+            to_import: list[StatisticData] = []
+            for hour_start, consumption in completed_points:
+                running_sum += consumption
+                hour_key = hour_start.isoformat()
+                if hour_key in imported_hours:
+                    continue
+                to_import.append(
+                    StatisticData(
+                        start=hour_start,
+                        state=running_sum,
+                        sum=running_sum,
+                    )
+                )
+                imported_hours.add(hour_key)
+
+            if not to_import:
+                if imported_hours:
+                    statistics_state[f"{series_key}_sum_at_max"] = running_sum
+                continue
+
+            metadata = StatisticMetaData(
+                has_mean=False,
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=f"Dominion SC Hourly {series_key.replace('_', ' ').title()}",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class=unit_class,
+                unit_of_measurement=unit,
+            )
+            async_add_external_statistics(self.hass, metadata, to_import)
+            statistics_state[series_key] = sorted(imported_hours)
+            statistics_state[f"{series_key}_sum_at_max"] = running_sum
+            _LOGGER.debug(
+                "Hourly statistics sync complete: series=%s imported=%s tracked=%s",
+                series_key,
+                len(to_import),
+                len(statistics_state[series_key]),
+            )
+
+    async def _sync_monthly_external_statistics(self, *, force_rewrite: bool = False) -> None:
+        """Import monthly ledger rows into external monthly statistics."""
+        if not self._monthly_statistics_enabled():
+            _LOGGER.debug("Monthly statistics sync skipped: disabled in options")
+            return
+        try:
+            from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
+            from homeassistant.components.recorder.statistics import (  # pylint: disable=import-outside-toplevel
+                StatisticData,
+                StatisticMetaData,
+                StatisticMeanType,
+                async_add_external_statistics,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Recorder monthly statistics import unavailable: %s", err)
+            return
+
+        statistics_state = self._state.setdefault("monthly_statistics_import", {})
+        fuel_config: list[tuple[str, str, str, str, str | None]] = [
+            ("electric", TOTAL_ELECTRIC_KWH, "kWh", "monthly_ledger", "energy"),
+            ("gas", TOTAL_GAS_FT3, "ft³", "monthly_ledger", "volume"),
+            ("electric_cost", TOTAL_ELECTRIC_COST, "$", "monthly_cost_ledger", None),
+            ("gas_cost", TOTAL_GAS_COST, "$", "monthly_cost_ledger", None),
+        ]
+        utility_today = self._utility_today()
+        now_month = date(utility_today.year, utility_today.month, 1)
+
+        for series_key, total_key, unit, ledger_name, unit_class in fuel_config:
+            fuel_prefix = series_key.replace("_cost", "")
+            statistic_id = self.get_monthly_statistic_id(total_key)
+            if not statistic_id:
+                continue
+
+            monthly_points: list[tuple[date, float]] = []
+            for key, value in (self._state.get(ledger_name, {}) or {}).items():
+                if not isinstance(key, str) or not key.startswith(f"{fuel_prefix}|"):
+                    continue
+                month_str = key.split("|", 1)[1]
+                try:
+                    year_s, month_s = month_str.split("-", 1)
+                    month_start = date(int(year_s), int(month_s), 1)
+                except (ValueError, TypeError):
+                    continue
+                # Skip the in-progress month — usage/cost are still changing.
+                if month_start >= now_month:
+                    continue
+                consumption = max(float(value or 0.0), 0.0)
+                # Zeros stay null — no monthly statistic entry for 0.
+                if consumption == 0.0:
+                    continue
+                monthly_points.append((month_start, consumption))
+
+            if not monthly_points:
+                _LOGGER.debug("Monthly statistics sync skipped for %s: no points", series_key)
+                continue
+
+            monthly_points.sort(key=lambda item: item[0])
+            imported_raw = statistics_state.setdefault(series_key, [])
+            imported_months = set(imported_raw if isinstance(imported_raw, list) else [])
+            point_month_set = {d.isoformat() for d, _ in monthly_points}
+            rewrite_for_fuel = force_rewrite
+            if not rewrite_for_fuel and imported_months:
+                if any(key not in point_month_set for key in imported_months):
+                    rewrite_for_fuel = True
+                else:
+                    max_imported = max(imported_months)
+                    precompute_sum = 0.0
+                    for month_start, consumption in monthly_points:
+                        precompute_sum += consumption
+                        if month_start.isoformat() == max_imported:
+                            break
+                    stored_max = statistics_state.get(f"{series_key}_sum_at_max")
+                    if stored_max is not None and abs(precompute_sum - float(stored_max)) > 0.001:
+                        rewrite_for_fuel = True
+
+            if rewrite_for_fuel:
+                imported_months.clear()
+                get_instance(self.hass).async_clear_statistics([statistic_id])
+                _LOGGER.info("Cleared existing monthly statistics for %s", statistic_id)
+
+            running_sum = 0.0
+            to_import: list[StatisticData] = []
+            for month_start, consumption in monthly_points:
+                running_sum += consumption
+                month_key = month_start.isoformat()
+                if month_key in imported_months:
+                    continue
+                to_import.append(
+                    StatisticData(
+                        start=self._local_midnight(month_start),
+                        state=running_sum,
+                        sum=running_sum,
+                    )
+                )
+                imported_months.add(month_key)
+
+            if not to_import:
+                if imported_months:
+                    statistics_state[f"{series_key}_sum_at_max"] = running_sum
+                continue
+
+            metadata = StatisticMetaData(
+                has_mean=False,
+                mean_type=StatisticMeanType.NONE,
+                has_sum=True,
+                name=f"Dominion SC Monthly {series_key.replace('_', ' ').title()}",
+                source=DOMAIN,
+                statistic_id=statistic_id,
+                unit_class=unit_class,
+                unit_of_measurement=unit,
+            )
+            async_add_external_statistics(self.hass, metadata, to_import)
+            statistics_state[series_key] = sorted(imported_months)
+            statistics_state[f"{series_key}_sum_at_max"] = running_sum
+            _LOGGER.debug(
+                "Monthly statistics sync complete: series=%s imported=%s tracked=%s",
+                series_key,
+                len(to_import),
+                len(statistics_state[series_key]),
+            )
+
+    def _local_tz(self) -> ZoneInfo:
+        """Dominion Bidgely wall-clock timezone (America/New_York).
+
+        Always Eastern — not Home Assistant's configured timezone — so hour and
+        calendar-day keys match the utility portal even when the HA host is UTC
+        or another zone.
+        """
+        return _DEFAULT_UTILITY_TZ
+
+    def _utility_now(self) -> datetime:
+        """Current time in the Dominion utility timezone."""
+        return datetime.now(self._local_tz())
+
+    def _utility_today(self) -> date:
+        """Current calendar day in the Dominion utility timezone."""
+        return self._utility_now().date()
+
+    def _local_midnight(self, day: date) -> datetime:
+        """Start of calendar day in utility local time (Energy day alignment)."""
+        return datetime.combine(day, time.min, tzinfo=self._local_tz())
+
+    @classmethod
+    def _parse_interval_end_datetime(
+        cls,
+        interval_end: str,
+        *,
+        tz: ZoneInfo | None = None,
+    ) -> datetime | None:
+        """Parse Bidgely intervalEndDate as utility-local wall clock (not UTC)."""
+        text = str(interval_end).strip()
+        if not text:
+            return None
+        local_tz = tz or _DEFAULT_UTILITY_TZ
+        for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
+            try:
+                parsed = datetime.strptime(text, fmt)
+                return parsed.replace(tzinfo=local_tz)
+            except ValueError:
+                continue
+        try:
+            parsed = datetime.fromisoformat(text.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+        if parsed.tzinfo is None:
+            return parsed.replace(tzinfo=local_tz)
+        return parsed.astimezone(local_tz)
+
+    @classmethod
+    def _day_key_from_bidgely_interval(
+        cls,
+        *,
+        interval_start: Any = None,
+        interval_end: Any = None,
+        tz: ZoneInfo | None = None,
+    ) -> str | None:
+        """Map Bidgely interval bounds to the portal calendar day.
+
+        Bidgely daily buckets commonly use an exclusive midnight ``intervalEnd``
+        (e.g. usage for Nov 15 ends at ``2026-11-16 00:00:00``). Using the end
+        date token alone stores the next day — one day ahead of the portal.
+        Prefer ``intervalStart`` when present; otherwise treat exact midnight
+        ends as belonging to the previous calendar day.
+        """
+        local_tz = tz or _DEFAULT_UTILITY_TZ
+        if interval_start not in (None, ""):
+            parsed_start = cls._parse_interval_end_datetime(str(interval_start), tz=local_tz)
+            if parsed_start is not None:
+                return parsed_start.date().isoformat()
+
+        if interval_end in (None, ""):
+            return None
+        parsed_end = cls._parse_interval_end_datetime(str(interval_end), tz=local_tz)
+        if parsed_end is None:
+            text = str(interval_end).strip()
+            return text.split(" ")[0] if text else None
+
+        if (
+            parsed_end.hour == 0
+            and parsed_end.minute == 0
+            and parsed_end.second == 0
+            and parsed_end.microsecond == 0
+        ):
+            return (parsed_end.date() - timedelta(days=1)).isoformat()
+        return parsed_end.date().isoformat()
+
+    def _migrate_day_ahead_and_utc_stats(self) -> None:
+        """Shift historical daily ledger keys back one day and force stats rewrite."""
+        if self._state.get("day_key_midnight_fix_applied"):
+            return
+
+        shifted = 0
+        for ledger_name in ("daily_ledger", "daily_cost_ledger"):
+            old_ledger = self._state.get(ledger_name, {}) or {}
+            if not isinstance(old_ledger, dict) or not old_ledger:
+                continue
+            new_ledger: dict[str, Any] = {}
+            for key, value in old_ledger.items():
+                if not isinstance(key, str) or "|" not in key:
+                    new_ledger[key] = value
+                    continue
+                fuel, day_str = key.split("|", 1)
+                try:
+                    day = date.fromisoformat(day_str) - timedelta(days=1)
+                except ValueError:
+                    new_ledger[key] = value
+                    continue
+                new_key = f"{fuel}|{day.isoformat()}"
+                # Prefer the shifted key; if collision, keep the larger value.
+                if new_key in new_ledger:
+                    new_ledger[new_key] = max(float(new_ledger[new_key] or 0.0), float(value or 0.0))
+                else:
+                    new_ledger[new_key] = value
+                shifted += 1
+            self._state[ledger_name] = new_ledger
+
+        # Reset import tracking so local-midnight timestamps replace UTC points.
+        for stats_key in (
+            "statistics_import",
+            "hourly_statistics_import",
+            "monthly_statistics_import",
+        ):
+            self._state[stats_key] = {}
+
+        self._state["day_key_midnight_fix_applied"] = True
+        self._state["_force_stats_rewrite"] = True
+        try:
+            self._recompute_totals_from_ledgers()
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not recompute totals after day-key migration", exc_info=True)
+        _LOGGER.info(
+            "Applied day-ahead ledger fix: shifted=%s daily keys; stats rewrite queued",
+            shifted,
+        )
+
+    @classmethod
+    def _aggregate_interval_ledger_to_hours(
+        cls,
+        ledger: dict[str, Any],
+        *,
+        fuel_prefix: str,
+        tz: ZoneInfo | None = None,
+    ) -> list[tuple[datetime, float]]:
+        """Bucket sub-hourly interval rows into hour-start cumulative-ready points."""
+        local_tz = tz or _DEFAULT_UTILITY_TZ
+        buckets: dict[datetime, float] = {}
+        for key, value in ledger.items():
+            if not isinstance(key, str) or not key.startswith(f"{fuel_prefix}|"):
+                continue
+            interval_end = key.split("|", 1)[1]
+            parsed = cls._parse_interval_end_datetime(interval_end, tz=local_tz)
+            if parsed is None:
+                continue
+            # Interval end belongs to the preceding hour bucket when exact hour.
+            # Example: 01:00:00 closes the 00:00 hour; 00:15 closes the 00:00 hour.
+            if parsed.minute == 0 and parsed.second == 0 and parsed.microsecond == 0:
+                hour_start = (parsed - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            else:
+                hour_start = parsed.replace(minute=0, second=0, microsecond=0)
+            buckets[hour_start] = buckets.get(hour_start, 0.0) + max(float(value or 0.0), 0.0)
+
+        return sorted(buckets.items(), key=lambda item: item[0])
+
+    async def _ensure_authenticated(self) -> None:
+        username = self.config_entry.data.get(CONF_USERNAME)
+        password = self.config_entry.data.get(CONF_PASSWORD)
+        stored_tfa_token = self.config_entry.data.get(CONF_TFA_TOKEN)
+        if not username or not password:
+            raise UpdateFailed("Missing username/password in config entry")
+
+        _LOGGER.debug(
+            "Authenticating entry=%s with stored_tfa_token=%s",
+            self.config_entry.entry_id,
+            bool(stored_tfa_token),
+        )
+
+        if stored_tfa_token:
+            self._client.tfa_token = str(stored_tfa_token)
+
+        try:
+            await self.hass.async_add_executor_job(self._client.login, username, password)
+        except Exception as err:  # pylint: disable=broad-except
+            raise UpdateFailed(f"Authentication failed: {err}") from err
+
+        refreshed_token = self._client.tfa_token
+        if refreshed_token and refreshed_token != stored_tfa_token:
+            new_data = dict(self.config_entry.data)
+            new_data[CONF_TFA_TOKEN] = refreshed_token
+            self.hass.config_entries.async_update_entry(self.config_entry, data=new_data)
+            _LOGGER.info("Updated stored tfa token for entry=%s", self.config_entry.entry_id)
+
+    async def _process_intervals(self, now_dt: datetime) -> None:
+        """Fetch Bidgely mode=day intervals and persist usage/cost ledgers.
+
+        Interval rows are recorded for hourly external statistics only. They do
+        not increment ``totals`` — those come from the daily ledger so Energy
+        Dashboard cumulative sensors are not double-counted.
+        """
+        lookback_hours = int(
+            self.config_entry.options.get(
+                CONF_INTERVAL_LOOKBACK_HOURS,
+                self.config_entry.data.get(
+                    CONF_INTERVAL_LOOKBACK_HOURS, DEFAULT_INTERVAL_LOOKBACK_HOURS
+                ),
+            )
+        )
+        start = now_dt - timedelta(hours=max(1, lookback_hours))
+        await self._store_interval_window(start, now_dt, electric_only=False)
+
+    async def _maybe_hourly_electric_catchup(self) -> None:
+        """Commit completed-hour electricity into hourly + progressive daily series.
+
+        Runs once per completed hour (poll may be every 15m; watermark prevents
+        repeats). Monthly series are intentionally not updated here.
+        """
+        if not self._hourly_statistics_enabled() and not self._daily_statistics_enabled():
+            return
+        if not self._state.get("initial_backfill_done"):
+            return
+
+        local_tz = self._local_tz()
+        now = self._utility_now()
+        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+        last_completed = current_hour_start - timedelta(hours=1)
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None, "last_hour_watermark": None},
+        )
+        if catchup.get("last_hour_watermark") == last_completed.isoformat():
+            return
+
+        lookback_hours = int(
+            self.config_entry.options.get(
+                CONF_INTERVAL_LOOKBACK_HOURS,
+                self.config_entry.data.get(
+                    CONF_INTERVAL_LOOKBACK_HOURS, DEFAULT_INTERVAL_LOOKBACK_HOURS
+                ),
+            )
+        )
+        window_start = last_completed - timedelta(hours=max(1, lookback_hours - 1))
+        try:
+            await self._store_interval_window(
+                window_start,
+                now,
+                electric_only=True,
+                overwrite=True,
+            )
+            self._rollup_today_daily_from_completed_hours()
+            # Exclusive midnight end (D+1 00:00) closes D's 23:00 hour. Once that
+            # hour completes, refresh D from mode=month so the daily series gets
+            # the full portal day — not a short interval lookback overwrite.
+            if last_completed.hour == 23:
+                completed_day = last_completed.date()
+                await self._catchup_electric_daily(completed_day, completed_day)
+            if self._hourly_statistics_enabled():
+                await self._sync_hourly_external_statistics(force_rewrite=False)
+            if self._daily_statistics_enabled():
+                await self._sync_external_statistics(force_rewrite=False)
+            catchup["last_hour_watermark"] = last_completed.isoformat()
+            _LOGGER.info(
+                "Hourly electricity catch-up committed hour ending %s",
+                current_hour_start.isoformat(),
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Hourly electricity catch-up failed: %s", err)
+
+    async def _maybe_monthly_electric_catchup(self) -> None:
+        """When the calendar month rolls, import the completed prior month once."""
+        if not self._monthly_statistics_enabled():
+            return
+        if not self._state.get("initial_backfill_done"):
+            return
+
+        now = self._utility_today()
+        current_month = date(now.year, now.month, 1)
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None, "last_month_watermark": None},
+        )
+        last_month_raw = catchup.get("last_month_watermark")
+        try:
+            last_month = date.fromisoformat(str(last_month_raw)) if last_month_raw else None
+        except ValueError:
+            last_month = None
+
+        # First run: stamp current month without forcing a sync (prior months
+        # already come from monthly reconcile / initial backfill).
+        if last_month is None:
+            catchup["last_month_watermark"] = current_month.isoformat()
+            return
+        if last_month >= current_month:
+            return
+
+        try:
+            await self._monthly_reconcile()
+            await self._sync_monthly_external_statistics(force_rewrite=False)
+            catchup["last_month_watermark"] = current_month.isoformat()
+            _LOGGER.info(
+                "Monthly electricity catch-up imported completed month before %s",
+                current_month.isoformat(),
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Monthly electricity catch-up failed: %s", err)
+
+    def _rollup_today_daily_from_completed_hours(self) -> None:
+        """Set today's daily electric ledger from sum of completed hours so far."""
+        local_tz = self._local_tz()
+        now_local = self._utility_now()
+        today = now_local.date()
+        current_hour_start = now_local.replace(minute=0, second=0, microsecond=0)
+
+        usage_hours = self._aggregate_interval_ledger_to_hours(
+            self._state.get("interval_ledger", {}) or {},
+            fuel_prefix="electric",
+            tz=local_tz,
+        )
+        cost_hours = self._aggregate_interval_ledger_to_hours(
+            self._state.get("interval_cost_ledger", {}) or {},
+            fuel_prefix="electric",
+            tz=local_tz,
+        )
+        usage_sum = sum(
+            value
+            for hour_start, value in usage_hours
+            if hour_start.date() == today and hour_start < current_hour_start
+        )
+        cost_sum = sum(
+            value
+            for hour_start, value in cost_hours
+            if hour_start.date() == today and hour_start < current_hour_start
+        )
+        day_key = today.isoformat()
+        self._upsert_daily(f"electric|{day_key}", usage_sum, True, TOTAL_ELECTRIC_KWH)
+        self._upsert_daily_cost(f"electric|{day_key}", cost_sum, True, TOTAL_ELECTRIC_COST)
+
+    async def _maybe_daily_electric_catchup(self) -> None:
+        """Run incremental electricity catch-up at most once per local calendar day."""
+        enabled = self._option_bool(
+            CONF_DAILY_ELECTRIC_CATCHUP, DEFAULT_DAILY_ELECTRIC_CATCHUP
+        )
+        if not enabled:
+            return
+
+        # Prefer finishing the one-time historical backfill before catch-up loops.
+        if not self._state.get("initial_backfill_done"):
+            await self.async_maybe_run_initial_backfill()
+            return
+
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None},
+        )
+        today = self._utility_today()
+        last_run_raw = catchup.get("last_run")
+        if last_run_raw:
+            try:
+                last_run_day = datetime.fromisoformat(str(last_run_raw)).date()
+            except ValueError:
+                last_run_day = None
+            if last_run_day == today:
+                return
+
+        try:
+            await self.async_sync_electricity_catchup(full_since_install=False)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Daily electricity catch-up failed: %s", err)
+
+    async def _catchup_electric_daily(self, start: date, end: date) -> None:
+        """Upsert electric daily usage/cost for [start, end] without touching backfill cycles."""
+        rows = await self._fetch_daily_rows(start, end)
+        lookback = int(
+            self.config_entry.options.get(
+                CONF_DAILY_LOOKBACK_DAYS,
+                self.config_entry.data.get(CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS),
+            )
+        )
+        lookback_cutoff = end - timedelta(days=max(1, lookback))
+        applied = 0
+        for row in rows:
+            if self._is_future_placeholder(row, end):
+                continue
+            if self._should_skip_daily_row(row, end, is_backfill=False):
+                continue
+            day_key = str(row["date"])
+            try:
+                row_date = date.fromisoformat(day_key)
+            except (ValueError, TypeError):
+                continue
+            if row_date < start or row_date > end:
+                continue
+
+            e_kwh = float(row["electric_usage_kwh"])
+            e_cost = float(row["electric_cost"])
+            in_lookback = row_date >= lookback_cutoff
+
+            if not (in_lookback and e_kwh == 0.0):
+                self._upsert_daily(f"electric|{day_key}", e_kwh, True, TOTAL_ELECTRIC_KWH)
+                applied += 1
+            if not (in_lookback and e_cost == 0.0):
+                self._upsert_daily_cost(f"electric|{day_key}", e_cost, True, TOTAL_ELECTRIC_COST)
+
+        _LOGGER.debug(
+            "Electric daily catch-up applied=%s range=%s..%s",
+            applied,
+            start.isoformat(),
+            end.isoformat(),
+        )
+
+    async def _catchup_electric_intervals(self, start: date, end: date) -> None:
+        """Fetch a capped hourly window ending at ``end`` (electric only)."""
+        hourly_days = min(
+            DEFAULT_CATCHUP_HOURLY_DAYS,
+            max(1, (end - start).days + 1),
+        )
+        window_start_date = max(start, end - timedelta(days=hourly_days - 1))
+        utility_tz = self._local_tz()
+        start_dt = datetime.combine(window_start_date, time.min, tzinfo=utility_tz)
+        end_dt = datetime.combine(end, time.max, tzinfo=utility_tz)
+        await self._store_interval_window(start_dt, end_dt, electric_only=True)
+
+    async def _store_interval_window(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        electric_only: bool,
+        overwrite: bool = False,
+    ) -> None:
+        """Persist Bidgely mode=day interval rows into interval ledgers."""
+        electric_payload = await self.hass.async_add_executor_job(
+            lambda: self._client.get_hourly_usage(
+                measurement_type="ELECTRIC",
+                day_start=start,
+                day_end=end,
+                locale="en_US",
+            )
+        )
+        if electric_only:
+            rows = self._merge_usage_rows(
+                electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
+                gas_rows=[],
+            )
+        else:
+            gas_payload = await self.hass.async_add_executor_job(
+                lambda: self._client.get_hourly_usage(
+                    measurement_type="GAS",
+                    day_start=start,
+                    day_end=end,
+                    locale="en_US",
+                )
+            )
+            rows = self._merge_usage_rows(
+                electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
+                gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
+            )
+
+        self._state["stats"]["raw_interval_rows"] += len(rows)
+        for row in rows:
+            interval_end = str(row["interval_end"])
+            e_key = f"electric|{interval_end}"
+            g_key = f"gas|{interval_end}"
+
+            self._store_interval_value(
+                self._state["interval_ledger"],
+                e_key,
+                float(row["electric_usage_kwh"]),
+                overwrite,
+                count_accepted=True,
+            )
+            self._store_interval_value(
+                self._state["interval_cost_ledger"],
+                e_key,
+                float(row["electric_cost"]),
+                overwrite,
+            )
+
+            if electric_only:
+                continue
+
+            self._store_interval_value(
+                self._state["interval_ledger"],
+                g_key,
+                float(row["gas_usage_ccf"]) * 100.0,
+                overwrite,
+            )
+            self._store_interval_value(
+                self._state["interval_cost_ledger"],
+                g_key,
+                float(row["gas_cost"]),
+                overwrite,
+            )
+
+    def _ensure_installed_at(self) -> None:
+        """Persist the first-seen integration timestamp once."""
+        if self._state.get("installed_at"):
+            return
+        self._state["installed_at"] = datetime.now().astimezone().isoformat()
+
+    def _installed_at_date(self) -> date:
+        """Return the calendar date the integration was first set up."""
+        self._ensure_installed_at()
+        raw = self._state.get("installed_at")
+        try:
+            return datetime.fromisoformat(str(raw)).date()
+        except (TypeError, ValueError):
+            return datetime.now().date()
+
+    @staticmethod
+    def _is_future_placeholder(row: dict[str, float | str], today: date) -> bool:
+        """Return True if the row is a zero-value placeholder for a future date."""
+        try:
+            row_date = date.fromisoformat(str(row["date"]))
+        except (ValueError, KeyError):
+            return False
+        if row_date <= today:
+            return False
+        # Future date: skip only if all usage/cost values are zero
+        usage_sum = (
+            abs(float(row.get("electric_usage_kwh", 0)))
+            + abs(float(row.get("gas_usage_ccf", 0)))
+            + abs(float(row.get("electric_cost", 0)))
+            + abs(float(row.get("gas_cost", 0)))
+        )
+        return usage_sum == 0.0
+
+    def _should_skip_daily_row(
+        self,
+        row: dict[str, float | str],
+        today: date,
+        *,
+        is_backfill: bool = False,
+    ) -> bool:
+        """Return True if a daily row should be skipped (not upserted into ledger).
+
+        Filtering rules:
+        - Today and future dates: always skip (data is never available yet).
+        - Recent dates (within lookback window): skip if ALL consumption AND
+          cost are null/zero — Dominion data may arrive later via lag-safe
+          reconciliation.  Rows with real data for one fuel but zero for the
+          other are kept.
+        - If a date falls within the lookback window, skip zero values for that date
+          regardless of whether all values are zero or not (to avoid importing
+          potentially incomplete data).
+        - Finalized dates (backfill): trust zero gas (legitimate in summer)
+          and zero cost; skip zero electric consumption (true zero essentially
+          impossible — HA itself draws power).
+
+        Args:
+            row: Merged daily usage row with electric_usage_kwh, gas_usage_ccf,
+                 electric_cost, gas_cost, and date fields.
+            today: Current date (UTC).
+            is_backfill: True if this row comes from a completed billing cycle
+                         (finalized data).
+
+        Returns:
+            True if the row should be skipped entirely.
+        """
+        try:
+            row_date = date.fromisoformat(str(row["date"]))
+        except (ValueError, KeyError):
+            return False
+
+        # Always skip today and future dates — data is never ready yet
+        if row_date >= today:
+            _LOGGER.debug(
+                "Skipping row for today/future date: %s", row["date"],
+            )
+            return True
+
+        e_kwh = float(row.get("electric_usage_kwh", 0) or 0)
+        g_ccf = float(row.get("gas_usage_ccf", 0) or 0)
+        e_cost = float(row.get("electric_cost", 0) or 0)
+        g_cost = float(row.get("gas_cost", 0) or 0)
+
+        all_zero = (e_kwh == 0.0 and g_ccf == 0.0 and e_cost == 0.0 and g_cost == 0.0)
+
+        if not is_backfill:
+            # Recent data within lookback window: skip only if everything is
+            # null/zero — this means Dominion hasn't delivered data yet.
+            # If at least one fuel has data, keep the row (the other fuel
+            # may legitimately be zero).
+            lookback_days = int(
+                self.config_entry.options.get(
+                    CONF_DAILY_LOOKBACK_DAYS,
+                    self.config_entry.data.get(
+                        CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS,
+                    ),
+                )
+            )
+            lookback_cutoff = today - timedelta(days=max(1, lookback_days))
+            if row_date >= lookback_cutoff and all_zero:
+                _LOGGER.debug(
+                    "Skipping recent all-zero row (data may arrive later): %s",
+                    row["date"],
+                )
+                return True
+            # NOTE: Per-fuel zero filtering (e.g. skip zero electric but keep
+            # gas) is handled at the individual _upsert_daily call sites in
+            # _daily_reconcile and _process_backfill, not here.  This method
+            # only skips the entire merged row when ALL values are zero.
+        else:
+            # Backfill / finalized data: trust zero for gas and cost,
+            # but skip if ALL values are zero (likely a data gap in API)
+            if all_zero:
+                _LOGGER.debug(
+                    "Skipping finalized all-zero row (likely data gap): %s",
+                    row["date"],
+                )
+                return True
+
+        return False
+
+    async def _daily_reconcile(self, now_date: date) -> None:
+        # Historically this routine fetched only a short lookback window.
+        # Change: scheduled reconciles should fetch the entire current billing
+        # cycle so the integration gets all days for the active cycle.
+        # The `current_billing_cycle` prefers `bill_projection`/`current_daily_usage`.
+        lookback = int(
+            self.config_entry.options.get(
+                CONF_DAILY_LOOKBACK_DAYS,
+                self.config_entry.data.get(CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS),
+            )
+        )
+        cycle = self.current_billing_cycle
+        start = cycle.start
+        end = cycle.end
+        _LOGGER.debug(
+            "Daily reconcile using billing cycle: start=%s end=%s (configured lookback=%s days)",
+            start.isoformat(), end.isoformat(), lookback,
+        )
+        rows = await self._fetch_daily_rows(start, end)
+
+        lookback_cutoff = now_date - timedelta(days=max(1, lookback))
+
+        for row in rows:
+            if self._is_future_placeholder(row, now_date):
+                _LOGGER.debug("Skipping future zero-value placeholder row: %s", row.get("date"))
+                continue
+            if self._should_skip_daily_row(row, now_date, is_backfill=False):
+                continue
+            day_key = row["date"]
+
+            # --- Per-fuel zero filtering within the lookback window ---
+            # Dominion lags ~2 days; zeros within the window are placeholders.
+            # Filter per-fuel so real data for one fuel isn't blocked by
+            # the other fuel's placeholder zero.
+            try:
+                row_date = date.fromisoformat(str(day_key))
+            except (ValueError, TypeError):
+                row_date = None
+            in_lookback = row_date is not None and row_date >= lookback_cutoff
+
+            e_kwh = float(row["electric_usage_kwh"])
+            g_ft3 = float(row["gas_usage_ccf"]) * 100.0
+            e_cost = float(row["electric_cost"])
+            g_cost = float(row["gas_cost"])
+
+            # Electric consumption: skip zero within lookback (lag placeholder)
+            if in_lookback and e_kwh == 0.0:
+                _LOGGER.debug(
+                    "Daily reconcile: skipping zero electric consumption for %s (lookback placeholder)",
+                    day_key,
+                )
+            else:
+                self._upsert_daily(f"electric|{day_key}", e_kwh, True, TOTAL_ELECTRIC_KWH)
+
+            # Electric cost: skip zero within lookback (lag placeholder)
+            if in_lookback and e_cost == 0.0:
+                _LOGGER.debug(
+                    "Daily reconcile: skipping zero electric cost for %s (lookback placeholder)",
+                    day_key,
+                )
+            else:
+                self._upsert_daily_cost(f"electric|{day_key}", e_cost, True, TOTAL_ELECTRIC_COST)
+
+            # Gas consumption: skip zero within lookback only if cost is also zero
+            # (zero gas is legitimate in summer when cost is also zero, but within
+            # the lookback window it's more likely a placeholder)
+            if in_lookback and g_ft3 == 0.0 and g_cost == 0.0:
+                _LOGGER.debug(
+                    "Daily reconcile: skipping zero gas consumption+cost for %s (lookback placeholder)",
+                    day_key,
+                )
+            else:
+                self._upsert_daily(f"gas|{day_key}", g_ft3, True, TOTAL_GAS_FT3)
+
+            # Gas cost: skip zero within lookback only if consumption is also zero
+            if in_lookback and g_cost == 0.0 and g_ft3 == 0.0:
+                pass  # already logged above
+            else:
+                self._upsert_daily_cost(f"gas|{day_key}", g_cost, True, TOTAL_GAS_COST)
+
+    async def _monthly_reconcile(self) -> None:
+        """Fetch Bidgely mode=year monthly usage/cost and upsert monthly ledgers.
+
+        Monthly buckets are recorded separately from daily totals so Energy
+        Dashboard cumulative sensors stay sourced from the daily ledger only.
+        """
+        rows = await self._fetch_monthly_rows()
+        if not rows:
+            _LOGGER.debug("Monthly reconcile: no rows returned")
+            return
+
+        for row in rows:
+            month_key = str(row.get("month") or "")
+            if not month_key:
+                continue
+            e_kwh = float(row["electric_usage_kwh"])
+            g_ft3 = float(row["gas_usage_ccf"]) * 100.0
+            e_cost = float(row["electric_cost"])
+            g_cost = float(row["gas_cost"])
+            self._upsert_monthly(f"electric|{month_key}", e_kwh, overwrite=True)
+            self._upsert_monthly(f"gas|{month_key}", g_ft3, overwrite=True)
+            self._upsert_monthly_cost(f"electric|{month_key}", e_cost, overwrite=True)
+            self._upsert_monthly_cost(f"gas|{month_key}", g_cost, overwrite=True)
+
+        _LOGGER.debug("Monthly reconcile stored %s month rows", len(rows))
+
+    async def _fetch_monthly_rows(self) -> list[dict[str, float | str]]:
+        """Fetch monthly usage/cost for electric and gas via Bidgely mode=year."""
+        electric_payload = await self.hass.async_add_executor_job(
+            lambda: self._client.get_monthly_usage(
+                measurement_type="ELECTRIC",
+                start=0,
+                include_ongoing=True,
+                locale="en_US",
+            )
+        )
+        gas_payload = await self.hass.async_add_executor_job(
+            lambda: self._client.get_monthly_usage(
+                measurement_type="GAS",
+                start=0,
+                include_ongoing=True,
+                locale="en_US",
+            )
+        )
+        return self._merge_monthly_rows(
+            electric_rows=self._parse_monthly_rows(electric_payload, fuel="electric"),
+            gas_rows=self._parse_monthly_rows(gas_payload, fuel="gas"),
+        )
+
+    @classmethod
+    def _parse_monthly_rows(cls, payload: Any, fuel: str) -> list[dict[str, float | str]]:
+        rows: list[dict[str, float | str]] = []
+        chart_rows: list[dict[str, Any]] = []
+        if isinstance(payload, dict):
+            chart_rows = (payload.get("payload") or {}).get("usageChartDataList") or []
+
+        for row in chart_rows:
+            interval_end = row.get("intervalEndDate") or row.get("intervalEnd")
+            month_key = cls._month_key_from_interval_end(str(interval_end) if interval_end else "")
+            if not month_key:
+                continue
+            consumption = max(float(row.get("consumption") or 0.0), 0.0)
+            cost = max(float(row.get("cost") or 0.0), 0.0)
+            rows.append(
+                {
+                    "month": month_key,
+                    "electric_usage_kwh": consumption if fuel == "electric" else 0.0,
+                    "gas_usage_ccf": consumption if fuel == "gas" else 0.0,
+                    "electric_cost": cost if fuel == "electric" else 0.0,
+                    "gas_cost": cost if fuel == "gas" else 0.0,
+                }
+            )
+        return rows
+
+    @classmethod
+    def _month_key_from_interval_end(cls, interval_end: str) -> str | None:
+        """Derive YYYY-MM from a Bidgely monthly interval end value."""
+        parsed = cls._parse_interval_end_datetime(interval_end)
+        if parsed is not None:
+            day = parsed.date()
+            # Exclusive midnight ends belong to the previous calendar day/month.
+            if (
+                parsed.hour == 0
+                and parsed.minute == 0
+                and parsed.second == 0
+                and parsed.microsecond == 0
+            ):
+                day = day - timedelta(days=1)
+            return f"{day.year:04d}-{day.month:02d}"
+        text = str(interval_end).strip()
+        if len(text) >= 7 and text[4] == "-":
+            candidate = text[:7]
+            try:
+                year_s, month_s = candidate.split("-", 1)
+                month_i = int(month_s)
+                if 1 <= month_i <= 12:
+                    return f"{int(year_s):04d}-{month_i:02d}"
+            except ValueError:
+                return None
+        return None
+
+    @staticmethod
+    def _merge_monthly_rows(
+        electric_rows: list[dict[str, float | str]],
+        gas_rows: list[dict[str, float | str]],
+    ) -> list[dict[str, float | str]]:
+        merged: dict[str, dict[str, float | str]] = {}
+
+        def _upsert(row: dict[str, float | str]) -> None:
+            key = str(row["month"])
+            if key not in merged:
+                merged[key] = {
+                    "month": key,
+                    "electric_usage_kwh": 0.0,
+                    "gas_usage_ccf": 0.0,
+                    "electric_cost": 0.0,
+                    "gas_cost": 0.0,
+                }
+            merged_row = merged[key]
+            merged_row["electric_usage_kwh"] = float(merged_row["electric_usage_kwh"]) + float(
+                row["electric_usage_kwh"]
+            )
+            merged_row["gas_usage_ccf"] = float(merged_row["gas_usage_ccf"]) + float(row["gas_usage_ccf"])
+            merged_row["electric_cost"] = float(merged_row["electric_cost"]) + float(row["electric_cost"])
+            merged_row["gas_cost"] = float(merged_row["gas_cost"]) + float(row["gas_cost"])
+
+        for row in electric_rows:
+            _upsert(row)
+        for row in gas_rows:
+            _upsert(row)
+        return [merged[key] for key in sorted(merged.keys())]
+
+    async def _process_backfill(
+        self,
+        overwrite: bool,
+        cycle_key: str | None = None,
+        allow_initialize_missing: bool = True,
+    ) -> None:
+        """Process a backfill cycle.
+
+        allow_initialize_missing controls whether the missing_cycles list may be
+        lazily repopulated when empty. Scheduled automatic updates should allow
+        initialization; manual service/button invocations will pass
+        allow_initialize_missing=False so they can early-exit when there are no
+        incomplete cycles to process.
+        """
+        if allow_initialize_missing:
+            self._initialize_backfill_cycles()
+        else:
+            # Manual invocation: if there are no missing cycles, warn and exit
+            backfill_state = self._state.get("backfill", {})
+            missing = backfill_state.get("missing_cycles", []) if isinstance(backfill_state, dict) else []
+            if not missing:
+                _LOGGER.warning(
+                    "Manual backfill requested but no incomplete backfill cycles to process for entry=%s",
+                    self.config_entry.entry_id,
+                )
+                return
+
+        cycle = self._pick_cycle_for_backfill(overwrite=overwrite, cycle_key=cycle_key)
+        if cycle is None:
+            _LOGGER.debug("Backfill skipped: no eligible cycle (overwrite=%s)", overwrite)
+            return
+
+        _LOGGER.debug("Backfill cycle selected: %s (overwrite=%s)", cycle.key, overwrite)
+
+        rows = await self._fetch_daily_rows(cycle.start, cycle.end)
+        in_range_rows = self._filter_rows_to_date_range(rows, cycle.start, cycle.end)
+        if not in_range_rows:
+            # Do not permanently complete empty cycles — Bidgely often returns the
+            # wrong billing window when skip_ongoing is forced. Retry later.
+            attempts = self._state.setdefault("backfill_empty_attempts", {})
+            attempt_n = int(attempts.get(cycle.key, 0)) + 1
+            attempts[cycle.key] = attempt_n
+            _LOGGER.warning(
+                "Backfill cycle %s returned no in-range rows (raw=%s attempt=%s/%s)",
+                cycle.key,
+                len(rows),
+                attempt_n,
+                5,
+            )
+            if attempt_n >= 5:
+                backfill = self._state["backfill"]
+                if cycle.key in backfill["missing_cycles"]:
+                    backfill["missing_cycles"].remove(cycle.key)
+                if cycle.key not in backfill["completed_cycles"]:
+                    backfill["completed_cycles"].append(cycle.key)
+                    backfill["cycles_completed"] += 1
+                _LOGGER.warning(
+                    "Backfill cycle %s marked complete after %s empty attempts",
+                    cycle.key,
+                    attempt_n,
+                )
+            return
+
+        today = self._utility_today()
+        _LOGGER.debug(
+            "Backfill cycle %s processing %s in-range daily rows (raw=%s)",
+            cycle.key,
+            len(in_range_rows),
+            len(rows),
+        )
+
+        for row in in_range_rows:
+            if self._is_future_placeholder(row, today):
+                _LOGGER.debug("Backfill skipping future zero-value placeholder row: %s", row.get("date"))
+                continue
+            if self._should_skip_daily_row(row, today, is_backfill=True):
+                continue
+            day_key = row["date"]
+
+            e_kwh = float(row["electric_usage_kwh"])
+            g_ft3 = float(row["gas_usage_ccf"]) * 100.0
+            e_cost = float(row["electric_cost"])
+            g_cost = float(row["gas_cost"])
+
+            # --- Per-fuel zero filtering for finalized/backfill cycles ---
+            # For finalized data, zero electric consumption is suspect
+            # (true zero essentially impossible — HA itself draws power).
+            # Trust zero for gas (legitimate in summer) and all cost series.
+            if e_kwh == 0.0:
+                _LOGGER.debug(
+                    "Backfill: skipping zero electric consumption for %s "
+                    "(finalized cycle — suspect placeholder)",
+                    day_key,
+                )
+            else:
+                self._upsert_daily(f"electric|{day_key}", e_kwh, overwrite, TOTAL_ELECTRIC_KWH)
+
+            # Electric cost: skip if electric consumption was zero (same placeholder)
+            if e_kwh == 0.0 and e_cost == 0.0:
+                _LOGGER.debug(
+                    "Backfill: skipping zero electric cost for %s (consumption also zero)",
+                    day_key,
+                )
+            else:
+                self._upsert_daily_cost(f"electric|{day_key}", e_cost, overwrite, TOTAL_ELECTRIC_COST)
+
+            # Gas: trust zero consumption and cost (legitimate in summer)
+            self._upsert_daily(f"gas|{day_key}", g_ft3, overwrite, TOTAL_GAS_FT3)
+            self._upsert_daily_cost(f"gas|{day_key}", g_cost, overwrite, TOTAL_GAS_COST)
+
+        backfill = self._state["backfill"]
+        if cycle.key in backfill["missing_cycles"]:
+            backfill["missing_cycles"].remove(cycle.key)
+        if cycle.key not in backfill["completed_cycles"]:
+            backfill["completed_cycles"].append(cycle.key)
+            backfill["cycles_completed"] += 1
+        # Clear empty-attempt counter on success
+        self._state.setdefault("backfill_empty_attempts", {}).pop(cycle.key, None)
+        _LOGGER.debug(
+            "Backfill cycle complete: %s cycles_completed=%s missing_remaining=%s",
+            cycle.key,
+            backfill["cycles_completed"],
+            len(backfill["missing_cycles"]),
+        )
+
+    async def _fetch_daily_rows(self, start: date, end: date) -> list[dict[str, float | str]]:
+        """Fetch Bidgely mode=month daily rows for an explicit date range.
+
+        Always prefer ``current_cycle=True`` (skip_ongoing_cycle=False) so the
+        Bidgely ``start``/``end`` window is honored. Forcing
+        ``current_cycle=False`` on historical calendar months often returns the
+        prior *billing* cycle (or empty), which does not match Oct 1–31 style
+        backfill windows and caused months to be marked complete with no data.
+
+        If the preferred fetch is empty, retry once with ``current_cycle=False``.
+        """
+        start_dt = datetime.combine(start, time.min, tzinfo=self._local_tz())
+        end_dt = datetime.combine(end, time.max, tzinfo=self._local_tz())
+
+        rows = await self._fetch_daily_rows_with_flag(
+            start_dt, end_dt, current_cycle=True
+        )
+        if not rows and end < self._utility_today():
+            _LOGGER.debug(
+                "Daily fetch empty for %s..%s with current_cycle=True; retrying current_cycle=False",
+                start.isoformat(),
+                end.isoformat(),
+            )
+            rows = await self._fetch_daily_rows_with_flag(
+                start_dt, end_dt, current_cycle=False
+            )
+        return rows
+
+    async def _fetch_daily_rows_with_flag(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        *,
+        current_cycle: bool,
+    ) -> list[dict[str, float | str]]:
+        electric_payload = await self.hass.async_add_executor_job(
+            lambda: self._client.get_daily_usage(
+                measurement_type="ELECTRIC",
+                current_cycle=current_cycle,
+                start=start_dt,
+                end=end_dt,
+                locale="en_US",
+            )
+        )
+        gas_payload = await self.hass.async_add_executor_job(
+            lambda: self._client.get_daily_usage(
+                measurement_type="GAS",
+                current_cycle=current_cycle,
+                start=start_dt,
+                end=end_dt,
+                locale="en_US",
+            )
+        )
+
+        try:
+            e_rows = (
+                (electric_payload.get("payload") or {}).get("usageChartDataList") or []
+                if isinstance(electric_payload, dict)
+                else []
+            )
+            g_rows = (
+                (gas_payload.get("payload") or {}).get("usageChartDataList") or []
+                if isinstance(gas_payload, dict)
+                else []
+            )
+            _LOGGER.debug(
+                "Daily fetch: start=%s end=%s current_cycle=%s electric_rows=%d gas_rows=%d",
+                start_dt.date().isoformat(),
+                end_dt.date().isoformat(),
+                current_cycle,
+                len(e_rows),
+                len(g_rows),
+            )
+        except Exception:  # Defensive: logging must not break processing
+            _LOGGER.debug(
+                "Daily fetch: start=%s end=%s current_cycle=%s (could not compute row counts)",
+                start_dt.date().isoformat(),
+                end_dt.date().isoformat(),
+                current_cycle,
+            )
+
+        return self._merge_usage_rows(
+            electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
+            gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
+        )
+
+    @staticmethod
+    def _filter_rows_to_date_range(
+        rows: list[dict[str, float | str]],
+        start: date,
+        end: date,
+    ) -> list[dict[str, float | str]]:
+        """Keep only rows whose parsed calendar day falls inside [start, end]."""
+        filtered: list[dict[str, float | str]] = []
+        for row in rows:
+            try:
+                row_date = date.fromisoformat(str(row["date"]))
+            except (ValueError, TypeError, KeyError):
+                continue
+            if start <= row_date <= end:
+                filtered.append(row)
+        return filtered
+
+    @classmethod
+    def _parse_usage_rows(cls, payload: Any, fuel: str) -> list[dict[str, float | str]]:
+        rows: list[dict[str, float | str]] = []
+        chart_rows: list[dict[str, Any]] = []
+        if isinstance(payload, dict):
+            chart_rows = (payload.get("payload") or {}).get("usageChartDataList") or []
+
+        for row in chart_rows:
+            interval_start = row.get("intervalStartDate") or row.get("intervalStart")
+            interval_end = row.get("intervalEndDate") or row.get("intervalEnd")
+            interval_end_s = str(interval_end)
+            day_key = cls._day_key_from_bidgely_interval(
+                interval_start=interval_start,
+                interval_end=interval_end,
+            )
+            if not day_key:
+                continue
+            consumption = max(float(row.get("consumption") or 0.0), 0.0)
+            cost = max(float(row.get("cost") or 0.0), 0.0)
+
+            rows.append(
+                {
+                    "interval_end": interval_end_s,
+                    "date": day_key,
+                    "electric_usage_kwh": consumption if fuel == "electric" else 0.0,
+                    "gas_usage_ccf": consumption if fuel == "gas" else 0.0,
+                    "electric_cost": cost if fuel == "electric" else 0.0,
+                    "gas_cost": cost if fuel == "gas" else 0.0,
+                }
+            )
+
+        return rows
+
+    @staticmethod
+    def _merge_usage_rows(
+        electric_rows: list[dict[str, float | str]],
+        gas_rows: list[dict[str, float | str]],
+    ) -> list[dict[str, float | str]]:
+        merged: dict[str, dict[str, float | str]] = {}
+
+        def _upsert(row: dict[str, float | str]) -> None:
+            key = str(row["interval_end"])
+            if key not in merged:
+                merged[key] = {
+                    "interval_end": row["interval_end"],
+                    "date": row["date"],
+                    "electric_usage_kwh": 0.0,
+                    "gas_usage_ccf": 0.0,
+                    "electric_cost": 0.0,
+                    "gas_cost": 0.0,
+                }
+            merged_row = merged[key]
+            merged_row["electric_usage_kwh"] = float(merged_row["electric_usage_kwh"]) + float(row["electric_usage_kwh"])
+            merged_row["gas_usage_ccf"] = float(merged_row["gas_usage_ccf"]) + float(row["gas_usage_ccf"])
+            merged_row["electric_cost"] = float(merged_row["electric_cost"]) + float(row["electric_cost"])
+            merged_row["gas_cost"] = float(merged_row["gas_cost"]) + float(row["gas_cost"])
+
+        for row in electric_rows:
+            _upsert(row)
+        for row in gas_rows:
+            _upsert(row)
+
+        return [merged[key] for key in sorted(merged.keys())]
+
+    def _initialize_backfill_cycles(self) -> None:
+        backfill = self._state["backfill"]
+
+        target = int(
+            self.config_entry.options.get(
+                CONF_BACKFILL_CYCLES_TARGET,
+                self.config_entry.data.get(CONF_BACKFILL_CYCLES_TARGET, DEFAULT_BACKFILL_CYCLES_TARGET),
+            )
+        )
+        # Always regenerate from current target (don't return early if cycles exist)
+        # This ensures that when user updates target or config is refreshed,
+        # the cycle list is regenerated and old/stale cycles are replaced
+        cycles = self._build_recent_monthly_cycles(now_date=datetime.now().date(), target=target)
+        eligible_keys = [cycle.key for cycle in cycles]
+        completed = set(backfill.get("completed_cycles", []))
+
+        # Only add cycles that haven't already been completed
+        backfill["missing_cycles"] = [k for k in eligible_keys if k not in completed]
+        _LOGGER.debug(
+            "Initialized backfill cycles: eligible=%d completed=%d missing=%d target=%d",
+            len(eligible_keys),
+            len(completed),
+            len(backfill["missing_cycles"]),
+            target,
+        )
+        if backfill["missing_cycles"]:
+            _LOGGER.debug(
+                "First 3 missing cycles (oldest to newest): %s",
+                backfill["missing_cycles"][:3],
+            )
+
+    @staticmethod
+    def _build_recent_monthly_cycles(now_date: date, target: int) -> list[BillingCycle]:
+        """Build a list of recent complete calendar month cycles.
+        
+        Backfill targets completed past cycles only. The current month is handled
+        by regular polling, so it's excluded from the backfill list.
+        """
+        cycles: list[BillingCycle] = []
+        if target <= 0:
+            return cycles
+
+        # Start from the first day of the previous month (exclude current month)
+        month_start = date(now_date.year, now_date.month, 1)
+        current = month_start - timedelta(days=1)  # Last day of previous month
+
+        while len(cycles) < target:
+            cycle_start = date(current.year, current.month, 1)
+            cycle_end = date(current.year, current.month, current.day)
+            cycles.append(BillingCycle(start=cycle_start, end=cycle_end))
+            current = cycle_start - timedelta(days=1)
+
+        cycles.reverse()
+        return cycles
+
+    def _pick_cycle_for_backfill(self, overwrite: bool, cycle_key: str | None) -> BillingCycle | None:
+        backfill = self._state["backfill"]
+
+        if cycle_key:
+            start_s, end_s = cycle_key.split("|")
+            return BillingCycle(start=date.fromisoformat(start_s), end=date.fromisoformat(end_s))
+
+        if overwrite and backfill["completed_cycles"]:
+            start_s, end_s = backfill["completed_cycles"][0].split("|")
+            return BillingCycle(start=date.fromisoformat(start_s), end=date.fromisoformat(end_s))
+
+        if not backfill["missing_cycles"]:
+            return None
+
+        start_s, end_s = backfill["missing_cycles"][0].split("|")
+        return BillingCycle(start=date.fromisoformat(start_s), end=date.fromisoformat(end_s))
+
+    def _check_statistics_migration(self) -> bool:
+        """Return True (force rewrite) once to migrate from sensor.* to external statistics.
+
+        Previous versions imported statistics into sensor.* statistic_ids with
+        source='recorder'. This conflicted with the HA recorder's auto-compiled
+        hourly statistics, creating negative deltas after restarts. The migration
+        clears old sensor.* rows and reimports into dominionsc:* external IDs.
+        """
+        if self._state.get("external_statistics_migration_done"):
+            return False
+        _LOGGER.info(
+            "One-time statistics migration: switching from sensor.* to "
+            "dominionsc:* external statistics (clears old conflicting rows)"
+        )
+        # Clear old sensor.* statistics that conflicted with recorder
+        try:
+            from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
+            recorder = get_instance(self.hass)
+            legacy_ids = self.get_legacy_sensor_statistic_ids()
+            if legacy_ids:
+                recorder.async_clear_statistics(legacy_ids)
+                _LOGGER.info("Migration: cleared old sensor.* statistic IDs: %s", legacy_ids)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Migration: could not clear old sensor.* stats", exc_info=True)
+        # Reset imported_days tracking so all data is reimported into new IDs
+        stats_state = self._state.get("statistics_import", {})
+        for key in list(stats_state.keys()):
+            if not key.endswith("_sum_at_max"):
+                stats_state[key] = []
+            else:
+                del stats_state[key]
+        self._state["external_statistics_migration_done"] = True
+        return True
+
+    def _check_unit_class_fix(self) -> bool:
+        """Return True (force rewrite) once to fix unit_class=None in external statistics.
+
+        Earlier versions created external statistics metadata without unit_class,
+        which prevents the Energy Dashboard picker from discovering them.  Clear
+        existing external statistics so they get re-created with proper unit_class
+        (energy/volume/monetary) on the next sync.
+        """
+        if self._state.get("unit_class_fix_applied"):
+            return False
+        _LOGGER.info(
+            "One-time unit_class fix: clearing external statistics to "
+            "re-create with proper unit_class for Energy Dashboard discovery"
+        )
+        try:
+            from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
+            recorder = get_instance(self.hass)
+            ext_ids = [
+                self.get_statistic_id(TOTAL_ELECTRIC_KWH),
+                self.get_statistic_id(TOTAL_GAS_FT3),
+                self.get_statistic_id(TOTAL_ELECTRIC_COST),
+                self.get_statistic_id(TOTAL_GAS_COST),
+            ]
+            ext_ids = [sid for sid in ext_ids if sid]
+            if ext_ids:
+                recorder.async_clear_statistics(ext_ids)  # do not await
+                _LOGGER.info("unit_class fix: cleared external statistic IDs: %s", ext_ids)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("unit_class fix: could not clear external stats", exc_info=True)
+        # Reset imported_days so all data is reimported with correct metadata
+        stats_state = self._state.get("statistics_import", {})
+        for key in list(stats_state.keys()):
+            if not key.endswith("_sum_at_max"):
+                stats_state[key] = []
+            else:
+                del stats_state[key]
+        self._state["unit_class_fix_applied"] = True
+        return True
+
+    def _store_interval_value(
+        self,
+        ledger: dict[str, Any],
+        key: str,
+        value: float,
+        overwrite: bool,
+        *,
+        count_accepted: bool = False,
+    ) -> bool:
+        """Store a positive interval value; zeros stay null (no entry)."""
+        value = max(float(value), 0.0)
+        if value == 0.0:
+            if overwrite:
+                ledger.pop(key, None)
+            return False
+        if key not in ledger or overwrite:
+            if count_accepted and key not in ledger:
+                self._state["stats"]["accepted_interval_rows"] += 1
+            ledger[key] = value
+            return True
+        return False
+
+    def _upsert_daily(self, key: str, value: float, overwrite: bool, total_key: str) -> None:
+        value = max(float(value), 0.0)
+        ledger = self._state["daily_ledger"]
+        # Zeros stay null — do not create (or keep) a 0 ledger entry.
+        if value == 0.0:
+            if overwrite and key in ledger:
+                old = float(ledger.pop(key))
+                self._state["totals"][total_key] -= old
+            return
+        if key not in ledger:
+            ledger[key] = value
+            self._state["totals"][total_key] += value
+            return
+        if overwrite:
+            old = float(ledger[key])
+            ledger[key] = value
+            self._state["totals"][total_key] += value - old
+
+    def _upsert_daily_cost(self, key: str, value: float, overwrite: bool, total_key: str) -> None:
+        value = max(float(value), 0.0)
+        ledger = self._state["daily_cost_ledger"]
+        if value == 0.0:
+            if overwrite and key in ledger:
+                old = float(ledger.pop(key))
+                self._state["totals"][total_key] -= old
+            return
+        if key not in ledger:
+            ledger[key] = value
+            self._state["totals"][total_key] += value
+            return
+        if overwrite:
+            old = float(ledger[key])
+            ledger[key] = value
+            self._state["totals"][total_key] += value - old
+
+    def _upsert_monthly(self, key: str, value: float, *, overwrite: bool) -> None:
+        value = max(float(value), 0.0)
+        ledger = self._state["monthly_ledger"]
+        if value == 0.0:
+            if overwrite:
+                ledger.pop(key, None)
+            return
+        if key not in ledger or overwrite:
+            ledger[key] = value
+
+    def _upsert_monthly_cost(self, key: str, value: float, *, overwrite: bool) -> None:
+        value = max(float(value), 0.0)
+        ledger = self._state["monthly_cost_ledger"]
+        if value == 0.0:
+            if overwrite:
+                ledger.pop(key, None)
+            return
+        if key not in ledger or overwrite:
+            ledger[key] = value
+
+    def _apply_monotonic_guard(self) -> None:
+        totals = self._state["totals"]
+        last = self._state["last_totals"]
+        for key in (TOTAL_ELECTRIC_KWH, TOTAL_GAS_FT3, TOTAL_ELECTRIC_COST, TOTAL_GAS_COST):
+            totals[key] = max(float(totals[key]), float(last.get(key, 0.0)))
+            last[key] = float(totals[key])
+
+    def _set_last_sync(self) -> None:
+        """Set the last_sync timestamp in persistent state to now (ISO 8601)."""
+        try:
+            # Prefer timezone-aware ISO format
+            self._state["last_sync"] = datetime.now().astimezone().isoformat()
+        except Exception:
+            # Fallback to naive ISO format
+            self._state["last_sync"] = datetime.now().isoformat()
+
+    async def _save_state(self) -> None:
+        await self._store.async_save(self._state)
+
+    def _default_state(self) -> dict[str, Any]:
+        return {
+            "interval_ledger": {},
+            "interval_cost_ledger": {},
+            "daily_ledger": {},
+            "daily_cost_ledger": {},
+            "monthly_ledger": {},
+            "monthly_cost_ledger": {},
+            "backfill": {
+                "cycles_completed": 0,
+                "missing_cycles": [],
+                "completed_cycles": [],
+            },
+            "totals": {
+                TOTAL_ELECTRIC_KWH: 0.0,
+                TOTAL_GAS_FT3: 0.0,
+                TOTAL_ELECTRIC_COST: 0.0,
+                TOTAL_GAS_COST: 0.0,
+            },
+            "last_totals": {
+                TOTAL_ELECTRIC_KWH: 0.0,
+                TOTAL_GAS_FT3: 0.0,
+                TOTAL_ELECTRIC_COST: 0.0,
+                TOTAL_GAS_COST: 0.0,
+            },
+            "stats": {
+                "raw_interval_rows": 0,
+                "accepted_interval_rows": 0,
+            },
+            "statistics_import": {
+                "electric": [],
+                "gas": [],
+            },
+            "hourly_statistics_import": {},
+            "monthly_statistics_import": {},
+            "installed_at": None,
+            "initial_backfill_done": False,
+            "day_key_midnight_fix_applied": False,
+            "electric_catchup": {
+                "last_run": None,
+                "watermark_date": None,
+            },
+            # ISO 8601 timestamp of the last successful sync/update
+            "last_sync": None,
+            "statistics_rewrite_once_done": False,
+            # Latest fetched account/billing payloads (for informational sensors)
+            "account_summary": {},
+            "bill_projection": {},
+            "current_daily_usage": {},
+            "current_bill_summary": {},
+        }
+
+    def _recompute_totals_from_ledgers(self) -> None:
+        """Recompute totals from persisted daily ledgers.
+
+        Totals are sourced only from daily usage/cost ledgers. Interval and
+        monthly ledgers are finer/coarser views of the same energy and must
+        not be added again (that previously double-counted vs daily).
+        """
+        totals = {
+            TOTAL_ELECTRIC_KWH: 0.0,
+            TOTAL_GAS_FT3: 0.0,
+            TOTAL_ELECTRIC_COST: 0.0,
+            TOTAL_GAS_COST: 0.0,
+        }
+
+        for key, val in (self._state.get("daily_ledger", {}) or {}).items():
+            try:
+                if isinstance(key, str) and key.startswith("electric|"):
+                    totals[TOTAL_ELECTRIC_KWH] += float(val or 0.0)
+                elif isinstance(key, str) and key.startswith("gas|"):
+                    totals[TOTAL_GAS_FT3] += float(val or 0.0)
+            except Exception:
+                continue
+
+        for key, val in (self._state.get("daily_cost_ledger", {}) or {}).items():
+            try:
+                if isinstance(key, str) and key.startswith("electric|"):
+                    totals[TOTAL_ELECTRIC_COST] += float(val or 0.0)
+                elif isinstance(key, str) and key.startswith("gas|"):
+                    totals[TOTAL_GAS_COST] += float(val or 0.0)
+            except Exception:
+                continue
+
+        # Respect monotonicity vs any recorded last_totals
+        last = self._state.get("last_totals", {}) or {}
+        for k in list(totals.keys()):
+            totals[k] = max(float(totals[k]), float(last.get(k, 0.0)))
+
+        self._state["totals"] = totals
+        # Also set last_totals so the monotonic guard uses this baseline
+        self._state["last_totals"] = {k: float(v) for k, v in totals.items()}
+
+    def _merge_state(self, stored: dict[str, Any]) -> dict[str, Any]:
+        merged = self._default_state()
+        merge_dicts = {
+            "interval_ledger",
+            "interval_cost_ledger",
+            "daily_ledger",
+            "daily_cost_ledger",
+            "monthly_ledger",
+            "monthly_cost_ledger",
+            "totals",
+            "last_totals",
+            "stats",
+            "backfill",
+            "statistics_import",
+            "hourly_statistics_import",
+            "monthly_statistics_import",
+            "electric_catchup",
+        }
+        for key, value in stored.items():
+            if key in merge_dicts and isinstance(value, dict):
+                merged[key].update(value)
+            else:
+                merged[key] = value
+        merged["statistics_rewrite_once_done"] = bool(merged.get("statistics_rewrite_once_done", False))
+        merged["initial_backfill_done"] = bool(merged.get("initial_backfill_done", False))
+        return merged

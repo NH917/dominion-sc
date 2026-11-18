@@ -506,7 +506,9 @@ class BidgelyClient:
         Convenience wrapper for day-mode usage (sub-daily / hourly intervals).
 
         Bidgely ``mode=day`` returns interval rows (often 15-minute) for the
-        requested window. Pass explicit start/end bounds.
+        requested window. Dominion SC portal calls use
+        ``show-at-granularity=false`` and ``skip-ongoing-cycle=true`` — matching
+        those flags is required for non-empty hourly payloads.
         """
         return self.get_usage_chart_details(
             user_id=user_id,
@@ -516,8 +518,8 @@ class BidgelyClient:
             end=day_end,
             locale=locale,
             next_bill_cycle=False,
-            show_at_granularity=True,
-            skip_ongoing_cycle=False,
+            show_at_granularity=False,
+            skip_ongoing_cycle=True,
         )
 
     def get_usage_by_year(

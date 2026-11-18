@@ -493,8 +493,10 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         await self._catchup_electric_daily(start, today)
         await self._catchup_electric_intervals(start, today)
         await self._monthly_reconcile()
+        # Force hourly rewrite so Dominion SC Hourly appears in the Energy picker
+        # after catch-up (metadata is only registered once points are imported).
         await self._sync_external_statistics(force_rewrite=False)
-        await self._sync_hourly_external_statistics(force_rewrite=False)
+        await self._sync_hourly_external_statistics(force_rewrite=True)
         await self._sync_monthly_external_statistics(force_rewrite=False)
         self._apply_monotonic_guard()
 
@@ -1005,9 +1007,16 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 if hour_start < current_hour_start and consumption > 0.0
             ]
             if not completed_points:
-                _LOGGER.debug(
-                    "Hourly statistics sync skipped for %s: no completed hours yet",
+                _LOGGER.info(
+                    "Hourly statistics sync skipped for %s: no completed hours yet "
+                    "(interval_ledger keys=%s). Energy picker will not list this "
+                    "series until at least one hour is imported.",
                     series_key,
+                    sum(
+                        1
+                        for k in (self._state.get(ledger_name, {}) or {})
+                        if isinstance(k, str) and k.startswith(f"{fuel_prefix}|")
+                    ),
                 )
                 continue
 
@@ -1055,11 +1064,12 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                     statistics_state[f"{series_key}_sum_at_max"] = running_sum
                 continue
 
+            friendly_label = series_key.replace("_", " ").title()
             metadata = StatisticMetaData(
                 has_mean=False,
                 mean_type=StatisticMeanType.NONE,
                 has_sum=True,
-                name=f"Dominion SC Hourly {series_key.replace('_', ' ').title()}",
+                name=f"Dominion SC Hourly {friendly_label}",
                 source=DOMAIN,
                 statistic_id=statistic_id,
                 unit_class=unit_class,
@@ -1068,11 +1078,12 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             async_add_external_statistics(self.hass, metadata, to_import)
             statistics_state[series_key] = sorted(imported_hours)
             statistics_state[f"{series_key}_sum_at_max"] = running_sum
-            _LOGGER.debug(
-                "Hourly statistics sync complete: series=%s imported=%s tracked=%s",
+            _LOGGER.info(
+                "Hourly statistics sync complete: series=%s imported=%s tracked=%s id=%s",
                 series_key,
                 len(to_import),
                 len(statistics_state[series_key]),
+                statistic_id,
             )
 
     async def _sync_monthly_external_statistics(self, *, force_rewrite: bool = False) -> None:
@@ -1613,7 +1624,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         utility_tz = self._local_tz()
         start_dt = datetime.combine(window_start_date, time.min, tzinfo=utility_tz)
         end_dt = datetime.combine(end, time.max, tzinfo=utility_tz)
-        await self._store_interval_window(start_dt, end_dt, electric_only=True)
+        await self._store_interval_window(
+            start_dt, end_dt, electric_only=True, overwrite=True
+        )
 
     async def _store_interval_window(
         self,
@@ -1652,18 +1665,20 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             )
 
         self._state["stats"]["raw_interval_rows"] += len(rows)
+        stored = 0
         for row in rows:
             interval_end = str(row["interval_end"])
             e_key = f"electric|{interval_end}"
             g_key = f"gas|{interval_end}"
 
-            self._store_interval_value(
+            if self._store_interval_value(
                 self._state["interval_ledger"],
                 e_key,
                 float(row["electric_usage_kwh"]),
                 overwrite,
                 count_accepted=True,
-            )
+            ):
+                stored += 1
             self._store_interval_value(
                 self._state["interval_cost_ledger"],
                 e_key,
@@ -1686,6 +1701,15 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 float(row["gas_cost"]),
                 overwrite,
             )
+
+        _LOGGER.info(
+            "Interval window stored: rows=%s positive_electric=%s overwrite=%s range=%s..%s",
+            len(rows),
+            stored,
+            overwrite,
+            start.isoformat(),
+            end.isoformat(),
+        )
 
     def _ensure_installed_at(self) -> None:
         """Persist the first-seen integration timestamp once."""

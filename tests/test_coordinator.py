@@ -495,7 +495,9 @@ async def test_process_intervals_dedupe(monkeypatch):
     }
 
     class ClientWithHourly:
-        def get_hourly_usage(self, measurement_type, day_start, day_end, locale):
+        def get_hourly_usage(
+            self, measurement_type, day_start, day_end, locale, skip_ongoing_cycle=True
+        ):
             if measurement_type == "ELECTRIC":
                 return electric_payload
             return gas_payload
@@ -559,6 +561,31 @@ def test_aggregate_midnight_interval_closes_prior_day_23_hour():
     eastern = sc_coordinator._DEFAULT_UTILITY_TZ
     assert hour_map[datetime.datetime(2026, 3, 10, 23, 0, tzinfo=eastern)] == 8.0
     assert datetime.datetime(2026, 3, 11, 0, 0, tzinfo=eastern) not in hour_map
+
+
+def test_parse_interval_end_accepts_epoch_seconds():
+    eastern = sc_coordinator._DEFAULT_UTILITY_TZ
+    # 2026-03-10 01:00:00 Eastern
+    local = datetime.datetime(2026, 3, 10, 1, 0, 0, tzinfo=eastern)
+    epoch = int(local.timestamp())
+    parsed = sc_coordinator.DominionSCCoordinator._parse_interval_end_datetime(epoch)
+    assert parsed is not None
+    assert parsed.astimezone(eastern).replace(tzinfo=eastern) == local
+
+    rows = sc_coordinator.DominionSCCoordinator._parse_usage_rows(
+        {
+            "payload": {
+                "usageChartDataList": [
+                    {"intervalEnd": epoch, "consumption": 1.25, "cost": 0.2},
+                    {"intervalEnd": None, "consumption": 9.0, "cost": 1.0},
+                ]
+            }
+        },
+        fuel="electric",
+    )
+    assert len(rows) == 1
+    assert rows[0]["electric_usage_kwh"] == 1.25
+    assert "None" not in str(rows[0]["interval_end"])
 
 
 def test_day_key_from_bidgely_midnight_end_is_previous_day():

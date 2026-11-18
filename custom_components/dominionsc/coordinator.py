@@ -1231,15 +1231,27 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
     @classmethod
     def _parse_interval_end_datetime(
         cls,
-        interval_end: str,
+        interval_end: str | int | float,
         *,
         tz: ZoneInfo | None = None,
     ) -> datetime | None:
         """Parse Bidgely intervalEndDate as utility-local wall clock (not UTC)."""
-        text = str(interval_end).strip()
-        if not text:
-            return None
         local_tz = tz or _DEFAULT_UTILITY_TZ
+        if isinstance(interval_end, (int, float)):
+            ts = float(interval_end)
+            if ts > 10**11:
+                ts /= 1000.0
+            return datetime.fromtimestamp(ts, tz=local_tz)
+
+        text = str(interval_end).strip()
+        if not text or text.lower() == "none":
+            return None
+        # Epoch seconds / millis encoded as a numeric string.
+        if text.lstrip("-").isdigit():
+            ts = int(text)
+            if abs(ts) > 10**11:
+                ts //= 1000
+            return datetime.fromtimestamp(ts, tz=local_tz)
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
             try:
                 parsed = datetime.strptime(text, fmt)
@@ -1628,6 +1640,86 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             start_dt, end_dt, electric_only=True, overwrite=True
         )
 
+    async def _fetch_interval_payload(
+        self,
+        measurement_type: str,
+        start: datetime,
+        end: datetime,
+    ) -> dict[str, Any]:
+        """Fetch Bidgely mode=day rows one calendar day at a time.
+
+        Multi-day windows often return empty for Dominion SC. Portal curls use
+        ``start=0``; we fall back to that when every per-day fetch is empty.
+        """
+        utility_tz = self._local_tz()
+        start_local = start.astimezone(utility_tz) if start.tzinfo else start.replace(tzinfo=utility_tz)
+        end_local = end.astimezone(utility_tz) if end.tzinfo else end.replace(tzinfo=utility_tz)
+        merged: list[dict[str, Any]] = []
+        day = start_local.date()
+        last = end_local.date()
+        today = self._utility_today()
+        while day <= last:
+            day_start = datetime.combine(day, time.min, tzinfo=utility_tz)
+            day_end = datetime.combine(day, time(23, 59, 59), tzinfo=utility_tz)
+            # Today is the ongoing cycle — include completed hours so far.
+            skip_ongoing = day < today
+            payload = await self.hass.async_add_executor_job(
+                lambda d0=day_start, d1=day_end, skip=skip_ongoing: self._client.get_hourly_usage(
+                    measurement_type=measurement_type,
+                    day_start=d0,
+                    day_end=d1,
+                    locale="en_US",
+                    skip_ongoing_cycle=skip,
+                )
+            )
+            rows = (
+                ((payload or {}).get("payload") or {}).get("usageChartDataList") or []
+                if isinstance(payload, dict)
+                else []
+            )
+            _LOGGER.debug(
+                "mode=day %s day=%s rows=%s",
+                measurement_type,
+                day.isoformat(),
+                len(rows),
+            )
+            if isinstance(rows, list):
+                merged.extend(rows)
+            day += timedelta(days=1)
+
+        if not merged:
+            payload = await self.hass.async_add_executor_job(
+                lambda: self._client.get_hourly_usage(
+                    measurement_type=measurement_type,
+                    day_start=0,
+                    day_end=None,
+                    locale="en_US",
+                )
+            )
+            rows = (
+                ((payload or {}).get("payload") or {}).get("usageChartDataList") or []
+                if isinstance(payload, dict)
+                else []
+            )
+            if isinstance(rows, list):
+                merged = rows
+            _LOGGER.info(
+                "mode=day %s start=0 fallback rows=%s",
+                measurement_type,
+                len(merged),
+            )
+
+        # Dedupe by interval end so overlapping day windows cannot inflate usage.
+        deduped: dict[str, dict[str, Any]] = {}
+        for row in merged:
+            if not isinstance(row, dict):
+                continue
+            key = row.get("intervalEndDate") or row.get("intervalEnd")
+            if key in (None, ""):
+                continue
+            deduped[str(key)] = row
+        return {"payload": {"usageChartDataList": list(deduped.values())}}
+
     async def _store_interval_window(
         self,
         start: datetime,
@@ -1637,28 +1729,14 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         overwrite: bool = False,
     ) -> None:
         """Persist Bidgely mode=day interval rows into interval ledgers."""
-        electric_payload = await self.hass.async_add_executor_job(
-            lambda: self._client.get_hourly_usage(
-                measurement_type="ELECTRIC",
-                day_start=start,
-                day_end=end,
-                locale="en_US",
-            )
-        )
+        electric_payload = await self._fetch_interval_payload("ELECTRIC", start, end)
         if electric_only:
             rows = self._merge_usage_rows(
                 electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
                 gas_rows=[],
             )
         else:
-            gas_payload = await self.hass.async_add_executor_job(
-                lambda: self._client.get_hourly_usage(
-                    measurement_type="GAS",
-                    day_start=start,
-                    day_end=end,
-                    locale="en_US",
-                )
-            )
+            gas_payload = await self._fetch_interval_payload("GAS", start, end)
             rows = self._merge_usage_rows(
                 electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
                 gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
@@ -2281,10 +2359,16 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         for row in chart_rows:
             interval_start = row.get("intervalStartDate") or row.get("intervalStart")
             interval_end = row.get("intervalEndDate") or row.get("intervalEnd")
-            interval_end_s = str(interval_end)
+            if interval_end in (None, ""):
+                continue
+            parsed_end = cls._parse_interval_end_datetime(interval_end)
+            if parsed_end is None:
+                continue
+            # Normalize ledger keys to a parseable wall-clock string.
+            interval_end_s = parsed_end.strftime("%Y-%m-%d %H:%M:%S")
             day_key = cls._day_key_from_bidgely_interval(
                 interval_start=interval_start,
-                interval_end=interval_end,
+                interval_end=interval_end_s,
             )
             if not day_key:
                 continue

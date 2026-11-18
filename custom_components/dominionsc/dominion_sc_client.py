@@ -679,6 +679,7 @@ class DominionSCClient:
         day_start: Optional[Union[int, float, datetime.datetime]] = None,
         day_end: Optional[Union[int, float, datetime.datetime]] = None,
         locale: str = "en_US",
+        skip_ongoing_cycle: bool = True,
     ) -> JsonDict:
         """Fetch sub-daily (hourly/interval) usage via Bidgely mode=day."""
         now = datetime.datetime.now(_UTILITY_TZ)
@@ -691,6 +692,7 @@ class DominionSCClient:
             day_start=resolved_start,
             day_end=resolved_end,
             locale=locale,
+            skip_ongoing_cycle=skip_ongoing_cycle,
         )
 
     def get_monthly_usage(

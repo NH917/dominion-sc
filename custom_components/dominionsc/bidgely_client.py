@@ -498,28 +498,29 @@ class BidgelyClient:
         *,
         user_id: Optional[str] = None,
         measurement_type: str = "ELECTRIC",
-        day_start: Union[int, float, datetime],
-        day_end: Union[int, float, datetime],
+        day_start: Optional[Union[int, float, datetime]] = None,
+        day_end: Optional[Union[int, float, datetime]] = None,
         locale: str = "en_US",
+        skip_ongoing_cycle: bool = True,
     ) -> JsonDict:
         """
         Convenience wrapper for day-mode usage (sub-daily / hourly intervals).
 
-        Bidgely ``mode=day`` returns interval rows (often 15-minute) for the
-        requested window. Dominion SC portal calls use
-        ``show-at-granularity=false`` and ``skip-ongoing-cycle=true`` — matching
-        those flags is required for non-empty hourly payloads.
+        Bidgely ``mode=day`` returns interval rows (often 15-minute). Dominion SC
+        portal calls use ``show-at-granularity=false``. Use
+        ``skip_ongoing_cycle=False`` when requesting today's in-progress day so
+        completed hours are not stripped. ``day_start=0`` is valid.
         """
         return self.get_usage_chart_details(
             user_id=user_id,
             measurement_type=measurement_type,
             mode="day",
-            start=day_start,
-            end=day_end,
+            start=0 if day_start is None else day_start,
+            end=day_end if day_end is not None else int(time.time()),
             locale=locale,
             next_bill_cycle=False,
             show_at_granularity=False,
-            skip_ongoing_cycle=True,
+            skip_ongoing_cycle=skip_ongoing_cycle,
         )
 
     def get_usage_by_year(

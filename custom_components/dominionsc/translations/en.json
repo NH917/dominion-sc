@@ -48,12 +48,14 @@
         "data": {
           "poll_minutes": "Polling interval",
           "backfill_cycles_target": "Backfill cycle target",
-          "daily_lookback_days": "Daily reconcile lookback days"
+          "daily_lookback_days": "Daily reconcile lookback days",
+          "daily_electric_catchup": "Daily electricity catch-up"
         },
         "data_description": {
           "poll_minutes": "How often to poll Dominion for new data (in minutes).",
           "backfill_cycles_target": "Number of most recent completed billing cycles to backfill. Increasing this adds unfilled cycles to the backfill queue.",
-          "daily_lookback_days": "Number of days to look back during daily reconciliation to catch late-arriving data."
+          "daily_lookback_days": "Number of days to look back during daily reconciliation to catch late-arriving data.",
+          "daily_electric_catchup": "Once per day, refresh electricity usage/cost from the catch-up watermark (since install) without re-running deep historical backfill."
         }
       }
     }

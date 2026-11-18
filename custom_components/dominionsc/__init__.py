@@ -27,6 +27,7 @@ from .const import (
     SERVICE_REWRITE_STATISTICS,
     SERVICE_RUN_BACKFILL,
     SERVICE_RUN_BACKFILL_ALL,
+    SERVICE_SYNC_ELECTRICITY_CATCHUP,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -65,6 +66,17 @@ REWRITE_SERVICE_SCHEMA = (
     else None
 )
 
+CATCHUP_SERVICE_SCHEMA = (
+    vol.Schema(
+        {
+            vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string,
+            vol.Optional("full_since_install", default=True): cv.boolean,
+        }
+    )
+    if vol is not None and cv is not None
+    else None
+)
+
 
 async def async_setup(hass, config: dict[str, Any]) -> bool:
     """Set up via YAML is not supported; config entries only."""
@@ -85,6 +97,9 @@ async def async_setup_entry(hass, entry) -> bool:
 
     hass.data[DOMAIN][entry.entry_id] = {COORDINATOR: coordinator}
     await hass.config_entries.async_forward_entry_setups(entry, PLATFORMS)
+
+    # One-time historical backfill after first successful refresh (does not block setup).
+    hass.async_create_task(coordinator.async_maybe_run_initial_backfill())
 
     if not hass.services.has_service(DOMAIN, SERVICE_RUN_BACKFILL):
 
@@ -108,6 +123,18 @@ async def async_setup_entry(hass, entry) -> bool:
             SERVICE_RUN_BACKFILL_ALL,
             _handle_backfill_all_service,
             schema=ALL_BACKFILL_SERVICE_SCHEMA,
+        )
+
+    if not hass.services.has_service(DOMAIN, SERVICE_SYNC_ELECTRICITY_CATCHUP):
+
+        async def _handle_catchup_service(call) -> None:
+            await _async_handle_electricity_catchup_service(hass, call)
+
+        hass.services.async_register(
+            DOMAIN,
+            SERVICE_SYNC_ELECTRICITY_CATCHUP,
+            _handle_catchup_service,
+            schema=CATCHUP_SERVICE_SCHEMA,
         )
 
     if not hass.services.has_service(DOMAIN, SERVICE_REWRITE_STATISTICS):
@@ -136,6 +163,8 @@ async def async_unload_entry(hass, entry) -> bool:
             hass.services.async_remove(DOMAIN, SERVICE_RUN_BACKFILL)
         if hass.services.has_service(DOMAIN, SERVICE_RUN_BACKFILL_ALL):
             hass.services.async_remove(DOMAIN, SERVICE_RUN_BACKFILL_ALL)
+        if hass.services.has_service(DOMAIN, SERVICE_SYNC_ELECTRICITY_CATCHUP):
+            hass.services.async_remove(DOMAIN, SERVICE_SYNC_ELECTRICITY_CATCHUP)
         if hass.services.has_service(DOMAIN, SERVICE_REWRITE_STATISTICS):
             hass.services.async_remove(DOMAIN, SERVICE_REWRITE_STATISTICS)
 
@@ -222,3 +251,20 @@ async def _async_handle_rewrite_statistics_service(hass, call) -> None:
             continue
         coordinator: DominionSCCoordinator = runtime[COORDINATOR]
         await coordinator.async_rewrite_statistics()
+
+
+async def _async_handle_electricity_catchup_service(hass, call) -> None:
+    """Handle sync_electricity_catchup for one or all config entries."""
+    from .coordinator import DominionSCCoordinator
+
+    target_entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
+    full_since_install = bool(call.data.get("full_since_install", True))
+
+    entries = hass.data.get(DOMAIN, {})
+    for entry_id, runtime in entries.items():
+        if target_entry_id and entry_id != target_entry_id:
+            continue
+        coordinator: DominionSCCoordinator = runtime[COORDINATOR]
+        await coordinator.async_sync_electricity_catchup(
+            full_since_install=full_since_install
+        )

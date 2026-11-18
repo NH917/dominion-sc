@@ -15,6 +15,7 @@ from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, Upda
 
 from .const import (
     CONF_BACKFILL_CYCLES_TARGET,
+    CONF_DAILY_ELECTRIC_CATCHUP,
     CONF_DAILY_LOOKBACK_DAYS,
     CONF_INTERVAL_LOOKBACK_HOURS,
     CONF_PASSWORD,
@@ -23,6 +24,8 @@ from .const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
     DEFAULT_BACKFILL_CYCLES_TARGET,
+    DEFAULT_CATCHUP_HOURLY_DAYS,
+    DEFAULT_DAILY_ELECTRIC_CATCHUP,
     DEFAULT_DAILY_LOOKBACK_DAYS,
     DEFAULT_INTERVAL_LOOKBACK_HOURS,
     DEFAULT_POLL_MINUTES,
@@ -88,6 +91,17 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             self._recompute_totals_from_ledgers()
         except Exception:  # defensive: do not let a recompute break startup
             _LOGGER.debug("Could not recompute totals from ledgers on setup", exc_info=True)
+
+        # Stamp install time once so catch-up can bound itself to "since integrated"
+        self._ensure_installed_at()
+
+        # Upgrades from older builds: if historical cycles were already drained,
+        # do not re-run the one-time initial backfill on next startup.
+        if not self._state.get("initial_backfill_done"):
+            completed = self._state.get("backfill", {}).get("completed_cycles") or []
+            missing = self._state.get("backfill", {}).get("missing_cycles") or []
+            if completed and not missing:
+                self._state["initial_backfill_done"] = True
 
         # Ensure backfill cycles are properly initialized after setup
         self._initialize_backfill_cycles()
@@ -317,6 +331,111 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         self.async_set_updated_data(dict(self.totals))
         _LOGGER.debug("Manual statistics rewrite finished: entry=%s", self.config_entry.entry_id)
 
+    async def async_maybe_run_initial_backfill(self) -> None:
+        """On first integration, drain the historical month-cycle backfill queue once.
+
+        Subsequent catch-up (button / daily) only fills from install → now and
+        does not re-queue completed historical cycles.
+        """
+        self._ensure_installed_at()
+        if self._state.get("initial_backfill_done"):
+            _LOGGER.debug(
+                "Initial backfill already completed for entry=%s",
+                self.config_entry.entry_id,
+            )
+            return
+        if getattr(self, "_initial_backfill_running", False):
+            return
+
+        self._initial_backfill_running = True
+        _LOGGER.info(
+            "Starting one-time initial historical backfill for entry=%s",
+            self.config_entry.entry_id,
+        )
+        try:
+            await self.async_run_backfill_all(overwrite=False)
+            # Also pull electricity from install → now so current cycle is filled.
+            await self.async_sync_electricity_catchup(full_since_install=True)
+            self._state["initial_backfill_done"] = True
+            await self._save_state()
+            _LOGGER.info(
+                "Initial historical backfill finished for entry=%s",
+                self.config_entry.entry_id,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            # Leave initial_backfill_done=False so the next daily/poll can retry.
+            _LOGGER.warning(
+                "Initial backfill failed for entry=%s: %s",
+                self.config_entry.entry_id,
+                err,
+            )
+        finally:
+            self._initial_backfill_running = False
+
+    async def async_sync_electricity_catchup(self, *, full_since_install: bool = True) -> None:
+        """Fill electricity (and cost) from install/watermark → now without deep re-backfill.
+
+        ``full_since_install=True`` (button): daily rows from installed_at → today,
+        plus a capped hourly window.
+        ``full_since_install=False`` (daily schedule): only from catch-up watermark
+        minus lookback → today.
+        """
+        await self._ensure_authenticated()
+        self._ensure_installed_at()
+
+        today = datetime.now().date()
+        installed = self._installed_at_date()
+        lookback = int(
+            self.config_entry.options.get(
+                CONF_DAILY_LOOKBACK_DAYS,
+                self.config_entry.data.get(CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS),
+            )
+        )
+
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None},
+        )
+        if full_since_install:
+            start = installed
+        else:
+            watermark_raw = catchup.get("watermark_date")
+            try:
+                watermark = date.fromisoformat(str(watermark_raw)) if watermark_raw else installed
+            except ValueError:
+                watermark = installed
+            start = max(installed, watermark - timedelta(days=max(1, lookback)))
+
+        if start > today:
+            start = today
+
+        _LOGGER.info(
+            "Electricity catch-up: entry=%s full_since_install=%s start=%s end=%s",
+            self.config_entry.entry_id,
+            full_since_install,
+            start.isoformat(),
+            today.isoformat(),
+        )
+
+        await self._catchup_electric_daily(start, today)
+        await self._catchup_electric_intervals(start, today)
+        await self._monthly_reconcile()
+        await self._sync_external_statistics(force_rewrite=False)
+        await self._sync_hourly_external_statistics(force_rewrite=False)
+        await self._sync_monthly_external_statistics(force_rewrite=False)
+        self._apply_monotonic_guard()
+
+        catchup["last_run"] = datetime.now().astimezone().isoformat()
+        catchup["watermark_date"] = today.isoformat()
+        self._set_last_sync()
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+        _LOGGER.debug(
+            "Electricity catch-up finished: entry=%s watermark=%s",
+            self.config_entry.entry_id,
+            catchup["watermark_date"],
+        )
+
     async def async_recalculate_backfill_target(self, new_target: int) -> None:
         """Recalculate missing backfill cycles when the target changes.
 
@@ -393,6 +512,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             await self._daily_reconcile(datetime.now().date())
             await self._monthly_reconcile()
             # Process at most one missing backfill cycle per scheduled update
+            # (initial install also drains the full queue via async_maybe_run_initial_backfill).
             await self._process_backfill(overwrite=False)
             # One-time migration: clear auto-compiled recorder rows that
             # conflict with our imported statistics after state_class removal.
@@ -402,6 +522,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             await self._sync_external_statistics(force_rewrite=force_rewrite)
             await self._sync_hourly_external_statistics(force_rewrite=force_rewrite)
             await self._sync_monthly_external_statistics(force_rewrite=force_rewrite)
+            # Once-per-day electricity catch-up since install/watermark (not deep history).
+            await self._maybe_daily_electric_catchup()
             self._apply_monotonic_guard()
             # Update last_sync timestamp for scheduled/automatic update
             self._set_last_sync()
@@ -1052,51 +1174,166 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             )
         )
         start = now_dt - timedelta(hours=max(1, lookback_hours))
+        await self._store_interval_window(start, now_dt, electric_only=False)
 
+    async def _maybe_daily_electric_catchup(self) -> None:
+        """Run incremental electricity catch-up at most once per local calendar day."""
+        enabled = bool(
+            self.config_entry.options.get(
+                CONF_DAILY_ELECTRIC_CATCHUP,
+                self.config_entry.data.get(
+                    CONF_DAILY_ELECTRIC_CATCHUP, DEFAULT_DAILY_ELECTRIC_CATCHUP
+                ),
+            )
+        )
+        if not enabled:
+            return
+
+        # Prefer finishing the one-time historical backfill before catch-up loops.
+        if not self._state.get("initial_backfill_done"):
+            await self.async_maybe_run_initial_backfill()
+            return
+
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None},
+        )
+        today = datetime.now().date()
+        last_run_raw = catchup.get("last_run")
+        if last_run_raw:
+            try:
+                last_run_day = datetime.fromisoformat(str(last_run_raw)).date()
+            except ValueError:
+                last_run_day = None
+            if last_run_day == today:
+                return
+
+        try:
+            await self.async_sync_electricity_catchup(full_since_install=False)
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Daily electricity catch-up failed: %s", err)
+
+    async def _catchup_electric_daily(self, start: date, end: date) -> None:
+        """Upsert electric daily usage/cost for [start, end] without touching backfill cycles."""
+        rows = await self._fetch_daily_rows(start, end)
+        lookback = int(
+            self.config_entry.options.get(
+                CONF_DAILY_LOOKBACK_DAYS,
+                self.config_entry.data.get(CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS),
+            )
+        )
+        lookback_cutoff = end - timedelta(days=max(1, lookback))
+        applied = 0
+        for row in rows:
+            if self._is_future_placeholder(row, end):
+                continue
+            if self._should_skip_daily_row(row, end, is_backfill=False):
+                continue
+            day_key = str(row["date"])
+            try:
+                row_date = date.fromisoformat(day_key)
+            except (ValueError, TypeError):
+                continue
+            if row_date < start or row_date > end:
+                continue
+
+            e_kwh = float(row["electric_usage_kwh"])
+            e_cost = float(row["electric_cost"])
+            in_lookback = row_date >= lookback_cutoff
+
+            if not (in_lookback and e_kwh == 0.0):
+                self._upsert_daily(f"electric|{day_key}", e_kwh, True, TOTAL_ELECTRIC_KWH)
+                applied += 1
+            if not (in_lookback and e_cost == 0.0):
+                self._upsert_daily_cost(f"electric|{day_key}", e_cost, True, TOTAL_ELECTRIC_COST)
+
+        _LOGGER.debug(
+            "Electric daily catch-up applied=%s range=%s..%s",
+            applied,
+            start.isoformat(),
+            end.isoformat(),
+        )
+
+    async def _catchup_electric_intervals(self, start: date, end: date) -> None:
+        """Fetch a capped hourly window ending at ``end`` (electric only)."""
+        hourly_days = min(
+            DEFAULT_CATCHUP_HOURLY_DAYS,
+            max(1, (end - start).days + 1),
+        )
+        window_start_date = max(start, end - timedelta(days=hourly_days - 1))
+        start_dt = datetime.combine(window_start_date, time.min)
+        end_dt = datetime.combine(end, time.max)
+        await self._store_interval_window(start_dt, end_dt, electric_only=True)
+
+    async def _store_interval_window(
+        self,
+        start: datetime,
+        end: datetime,
+        *,
+        electric_only: bool,
+    ) -> None:
+        """Persist Bidgely mode=day interval rows into interval ledgers."""
         electric_payload = await self.hass.async_add_executor_job(
             lambda: self._client.get_hourly_usage(
                 measurement_type="ELECTRIC",
                 day_start=start,
-                day_end=now_dt,
+                day_end=end,
                 locale="en_US",
             )
         )
-        gas_payload = await self.hass.async_add_executor_job(
-            lambda: self._client.get_hourly_usage(
-                measurement_type="GAS",
-                day_start=start,
-                day_end=now_dt,
-                locale="en_US",
+        if electric_only:
+            rows = self._merge_usage_rows(
+                electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
+                gas_rows=[],
             )
-        )
+        else:
+            gas_payload = await self.hass.async_add_executor_job(
+                lambda: self._client.get_hourly_usage(
+                    measurement_type="GAS",
+                    day_start=start,
+                    day_end=end,
+                    locale="en_US",
+                )
+            )
+            rows = self._merge_usage_rows(
+                electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
+                gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
+            )
 
-        rows = self._merge_usage_rows(
-            electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
-            gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
-        )
         self._state["stats"]["raw_interval_rows"] += len(rows)
-
         for row in rows:
             interval_end = str(row["interval_end"])
             e_key = f"electric|{interval_end}"
             g_key = f"gas|{interval_end}"
 
             if e_key not in self._state["interval_ledger"]:
-                e_usage = float(row["electric_usage_kwh"])
-                self._state["interval_ledger"][e_key] = e_usage
+                self._state["interval_ledger"][e_key] = float(row["electric_usage_kwh"])
                 self._state["stats"]["accepted_interval_rows"] += 1
+            if e_key not in self._state["interval_cost_ledger"]:
+                self._state["interval_cost_ledger"][e_key] = float(row["electric_cost"])
+
+            if electric_only:
+                continue
 
             if g_key not in self._state["interval_ledger"]:
-                g_ft3 = float(row["gas_usage_ccf"]) * 100.0
-                self._state["interval_ledger"][g_key] = g_ft3
-
-            if e_key not in self._state["interval_cost_ledger"]:
-                e_cost = float(row["electric_cost"])
-                self._state["interval_cost_ledger"][e_key] = e_cost
-
+                self._state["interval_ledger"][g_key] = float(row["gas_usage_ccf"]) * 100.0
             if g_key not in self._state["interval_cost_ledger"]:
-                g_cost = float(row["gas_cost"])
-                self._state["interval_cost_ledger"][g_key] = g_cost
+                self._state["interval_cost_ledger"][g_key] = float(row["gas_cost"])
+
+    def _ensure_installed_at(self) -> None:
+        """Persist the first-seen integration timestamp once."""
+        if self._state.get("installed_at"):
+            return
+        self._state["installed_at"] = datetime.now().astimezone().isoformat()
+
+    def _installed_at_date(self) -> date:
+        """Return the calendar date the integration was first set up."""
+        self._ensure_installed_at()
+        raw = self._state.get("installed_at")
+        try:
+            return datetime.fromisoformat(str(raw)).date()
+        except (TypeError, ValueError):
+            return datetime.now().date()
 
     @staticmethod
     def _is_future_placeholder(row: dict[str, float | str], today: date) -> bool:
@@ -1856,6 +2093,12 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             },
             "hourly_statistics_import": {},
             "monthly_statistics_import": {},
+            "installed_at": None,
+            "initial_backfill_done": False,
+            "electric_catchup": {
+                "last_run": None,
+                "watermark_date": None,
+            },
             # ISO 8601 timestamp of the last successful sync/update
             "last_sync": None,
             "statistics_rewrite_once_done": False,
@@ -1923,6 +2166,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             "statistics_import",
             "hourly_statistics_import",
             "monthly_statistics_import",
+            "electric_catchup",
         }
         for key, value in stored.items():
             if key in merge_dicts and isinstance(value, dict):
@@ -1930,4 +2174,5 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             else:
                 merged[key] = value
         merged["statistics_rewrite_once_done"] = bool(merged.get("statistics_rewrite_once_done", False))
+        merged["initial_backfill_done"] = bool(merged.get("initial_backfill_done", False))
         return merged

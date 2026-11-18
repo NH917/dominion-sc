@@ -538,10 +538,148 @@ async def test_monthly_reconcile_stores_ledgers(monkeypatch):
     assert coord.totals[const.TOTAL_ELECTRIC_KWH] == 0.0
 
 
-    def test_coordinator_properties_default_empty(monkeypatch):
-        """Coordinator should expose account/billing properties and default to empty dicts."""
-        coord = make_coordinator(None)
-        assert coord.account_summary == {}
-        assert coord.bill_projection == {}
-        assert coord.current_bill_summary == {}
-        assert coord.current_daily_usage == {}
+def test_coordinator_properties_default_empty(monkeypatch):
+    """Coordinator should expose account/billing properties and default to empty dicts."""
+    coord = make_coordinator(None)
+    assert coord.account_summary == {}
+    assert coord.bill_projection == {}
+    assert coord.current_bill_summary == {}
+    assert coord.current_daily_usage == {}
+
+
+def test_ensure_installed_at_and_upgrade_skips_initial_backfill():
+    coord = make_coordinator(None)
+    assert coord._state["installed_at"] is None
+    coord._ensure_installed_at()
+    first = coord._state["installed_at"]
+    assert first
+    coord._ensure_installed_at()
+    assert coord._state["installed_at"] == first
+
+    # Simulate upgrade with completed historical cycles
+    coord2 = make_coordinator(None)
+    coord2._state["backfill"]["completed_cycles"] = ["2026-01-01|2026-01-31"]
+    coord2._state["backfill"]["missing_cycles"] = []
+    coord2._state["initial_backfill_done"] = False
+    # Re-run the upgrade heuristic from async_setup
+    if not coord2._state.get("initial_backfill_done"):
+        completed = coord2._state.get("backfill", {}).get("completed_cycles") or []
+        missing = coord2._state.get("backfill", {}).get("missing_cycles") or []
+        if completed and not missing:
+            coord2._state["initial_backfill_done"] = True
+    assert coord2._state["initial_backfill_done"] is True
+
+
+@pytest.mark.asyncio
+async def test_electricity_catchup_full_since_install(monkeypatch):
+    coord = make_coordinator(None)
+    coord._state["installed_at"] = "2026-03-01T12:00:00-05:00"
+    coord._state["initial_backfill_done"] = True
+
+    async def fake_auth():
+        return None
+
+    async def fake_daily(start, end):
+        assert start == datetime.date(2026, 3, 1)
+        return [
+            {
+                "date": "2026-03-01",
+                "electric_usage_kwh": 4.0,
+                "gas_usage_ccf": 0.0,
+                "electric_cost": 0.8,
+                "gas_cost": 0.0,
+            }
+        ]
+
+    async def fake_intervals(start, end):
+        return None
+
+    async def fake_monthly():
+        return None
+
+    async def fake_sync(force_rewrite=False):
+        return None
+
+    async def fake_save():
+        return None
+
+    monkeypatch.setattr(coord, "_ensure_authenticated", fake_auth)
+    monkeypatch.setattr(coord, "_catchup_electric_daily", fake_daily)
+    monkeypatch.setattr(coord, "_catchup_electric_intervals", fake_intervals)
+    monkeypatch.setattr(coord, "_monthly_reconcile", fake_monthly)
+    monkeypatch.setattr(coord, "_sync_external_statistics", fake_sync)
+    monkeypatch.setattr(coord, "_sync_hourly_external_statistics", fake_sync)
+    monkeypatch.setattr(coord, "_sync_monthly_external_statistics", fake_sync)
+    monkeypatch.setattr(coord, "_save_state", fake_save)
+
+    # Freeze "today" used by catch-up
+    class FixedDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 10, 15, 0, 0, tzinfo=datetime.timezone.utc)
+
+    monkeypatch.setattr(sc_coordinator, "datetime", FixedDateTime)
+
+    await coord.async_sync_electricity_catchup(full_since_install=True)
+    assert coord._state["electric_catchup"]["watermark_date"] == "2026-03-10"
+    assert coord._state["electric_catchup"]["last_run"]
+
+
+@pytest.mark.asyncio
+async def test_maybe_daily_electric_catchup_runs_once(monkeypatch):
+    coord = make_coordinator(None)
+    coord._state["initial_backfill_done"] = True
+    coord._state["electric_catchup"] = {
+        "last_run": "2026-03-10T01:00:00+00:00",
+        "watermark_date": "2026-03-10",
+    }
+    calls = {"n": 0}
+
+    async def fake_catchup(*, full_since_install):
+        calls["n"] += 1
+
+    monkeypatch.setattr(coord, "async_sync_electricity_catchup", fake_catchup)
+
+    class FixedDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 10, 18, 0, 0, tzinfo=datetime.timezone.utc)
+
+    monkeypatch.setattr(sc_coordinator, "datetime", FixedDateTime)
+    await coord._maybe_daily_electric_catchup()
+    assert calls["n"] == 0  # already ran today
+
+    class NextDay(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 11, 8, 0, 0, tzinfo=datetime.timezone.utc)
+
+    monkeypatch.setattr(sc_coordinator, "datetime", NextDay)
+    await coord._maybe_daily_electric_catchup()
+    assert calls["n"] == 1
+
+
+@pytest.mark.asyncio
+async def test_maybe_run_initial_backfill_once(monkeypatch):
+    coord = make_coordinator(None)
+    calls = {"backfill": 0, "catchup": 0}
+
+    async def fake_backfill_all(overwrite=False):
+        calls["backfill"] += 1
+
+    async def fake_catchup(*, full_since_install):
+        calls["catchup"] += 1
+
+    async def fake_save():
+        return None
+
+    monkeypatch.setattr(coord, "async_run_backfill_all", fake_backfill_all)
+    monkeypatch.setattr(coord, "async_sync_electricity_catchup", fake_catchup)
+    monkeypatch.setattr(coord, "_save_state", fake_save)
+
+    await coord.async_maybe_run_initial_backfill()
+    assert calls == {"backfill": 1, "catchup": 1}
+    assert coord._state["initial_backfill_done"] is True
+
+    await coord.async_maybe_run_initial_backfill()
+    assert calls == {"backfill": 1, "catchup": 1}

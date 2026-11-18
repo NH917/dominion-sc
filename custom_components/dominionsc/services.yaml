@@ -42,6 +42,28 @@ run_backfill_all:
       selector:
         boolean:
 
+sync_electricity_catchup:
+  name: Sync electricity since install
+  description: >
+    Fill electricity usage/cost from the integration install date (or catch-up
+    watermark) to now. Does not re-run deep historical billing-cycle backfill.
+  fields:
+    config_entry_id:
+      name: Config entry ID
+      description: Optional specific Dominion SC config entry ID.
+      required: false
+      selector:
+        text:
+    full_since_install:
+      name: Full since install
+      description: >
+        When true (default), refill from the original install date to today.
+        When false, only catch up from the last daily watermark (minus lookback).
+      required: false
+      default: true
+      selector:
+        boolean:
+
 rewrite_statistics:
   name: Rewrite statistics
   description: Clear legacy dominionsc external statistics so Energy Dashboard uses recorder sensor statistics only.

@@ -9,6 +9,7 @@ import voluptuous as vol
 
 from homeassistant import config_entries
 from homeassistant.helpers.selector import (
+    BooleanSelector,
     NumberSelector,
     NumberSelectorConfig,
     NumberSelectorMode,
@@ -16,6 +17,7 @@ from homeassistant.helpers.selector import (
 
 from .const import (
     CONF_BACKFILL_CYCLES_TARGET,
+    CONF_DAILY_ELECTRIC_CATCHUP,
     CONF_DAILY_LOOKBACK_DAYS,
     CONF_PASSWORD,
     CONF_POLL_MINUTES,
@@ -23,6 +25,7 @@ from .const import (
     CONF_USERNAME,
     CONF_VERIFY_SSL,
     DEFAULT_BACKFILL_CYCLES_TARGET,
+    DEFAULT_DAILY_ELECTRIC_CATCHUP,
     DEFAULT_DAILY_LOOKBACK_DAYS,
     DEFAULT_POLL_MINUTES,
     DEFAULT_VERIFY_SSL,
@@ -345,6 +348,17 @@ class DominionSCOptionsFlow(config_entries.OptionsFlow):
                         unit_of_measurement="days",
                     )
                 ),
+                vol.Optional(
+                    CONF_DAILY_ELECTRIC_CATCHUP,
+                    description={
+                        "suggested_value": bool(
+                            _get_current(
+                                CONF_DAILY_ELECTRIC_CATCHUP,
+                                DEFAULT_DAILY_ELECTRIC_CATCHUP,
+                            )
+                        )
+                    },
+                ): BooleanSelector(),
             }
         )
         return self.async_show_form(step_id="init", data_schema=schema)

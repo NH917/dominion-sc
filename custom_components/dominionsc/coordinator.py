@@ -7,16 +7,23 @@ from datetime import UTC, date, datetime, time, timedelta
 import logging
 import re
 from typing import Any
+from zoneinfo import ZoneInfo
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
 from homeassistant.helpers.storage import Store
 from homeassistant.helpers.update_coordinator import DataUpdateCoordinator, UpdateFailed
 
+# Dominion SC Bidgely timestamps are Eastern local wall-clock values.
+_DEFAULT_UTILITY_TZ = ZoneInfo("America/New_York")
+
 from .const import (
     CONF_BACKFILL_CYCLES_TARGET,
     CONF_DAILY_ELECTRIC_CATCHUP,
     CONF_DAILY_LOOKBACK_DAYS,
+    CONF_ENABLE_DAILY_STATISTICS,
+    CONF_ENABLE_HOURLY_STATISTICS,
+    CONF_ENABLE_MONTHLY_STATISTICS,
     CONF_INTERVAL_LOOKBACK_HOURS,
     CONF_PASSWORD,
     CONF_POLL_MINUTES,
@@ -27,6 +34,9 @@ from .const import (
     DEFAULT_CATCHUP_HOURLY_DAYS,
     DEFAULT_DAILY_ELECTRIC_CATCHUP,
     DEFAULT_DAILY_LOOKBACK_DAYS,
+    DEFAULT_ENABLE_DAILY_STATISTICS,
+    DEFAULT_ENABLE_HOURLY_STATISTICS,
+    DEFAULT_ENABLE_MONTHLY_STATISTICS,
     DEFAULT_INTERVAL_LOOKBACK_HOURS,
     DEFAULT_POLL_MINUTES,
     DEFAULT_VERIFY_SSL,
@@ -76,6 +86,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         self._client = DominionSCClient(verify_ssl=verify_ssl)
         self._store = Store[dict[str, Any]](hass, STORE_VERSION, f"{STORE_KEY_PREFIX}{entry.entry_id}")
         self._state: dict[str, Any] = self._default_state()
+        # Prevent overlapping backfill from button/service/initial/poll.
+        self._backfill_busy = False
 
     async def async_setup(self) -> None:
         """Load persisted state before first refresh."""
@@ -103,6 +115,10 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             if completed and not missing:
                 self._state["initial_backfill_done"] = True
 
+        # One-time: Bidgely midnight intervalEnd was stored as the next calendar
+        # day and stats used UTC midnight (Energy bars at ~7–8pm prior evening).
+        self._migrate_day_ahead_and_utc_stats()
+
         # Ensure backfill cycles are properly initialized after setup
         self._initialize_backfill_cycles()
         
@@ -113,6 +129,36 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
     @property
     def backfill(self) -> dict[str, Any]:
         return self._state["backfill"]
+
+    @property
+    def backfill_in_progress(self) -> bool:
+        """True while a backfill (one-cycle, full, or initial) is running."""
+        return bool(getattr(self, "_backfill_busy", False))
+
+    def _try_begin_backfill(self, reason: str) -> bool:
+        """Acquire the backfill busy flag. Returns False if already running."""
+        if self._backfill_busy:
+            _LOGGER.warning(
+                "Backfill already in progress for entry=%s; ignoring %s",
+                self.config_entry.entry_id,
+                reason,
+            )
+            return False
+        self._backfill_busy = True
+        # Notify button entities so they become unavailable.
+        try:
+            self.async_set_updated_data(dict(self.totals))
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not publish backfill-busy state", exc_info=True)
+        return True
+
+    def _end_backfill(self) -> None:
+        """Release the backfill busy flag and refresh entities."""
+        self._backfill_busy = False
+        try:
+            self.async_set_updated_data(dict(self.totals))
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not publish backfill-idle state", exc_info=True)
 
     @property
     def account_summary(self) -> dict[str, Any]:
@@ -254,8 +300,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 )
             return BillingCycle(start=start, end=end)
 
-        # Final fallback: month start to today
-        now = datetime.now().date()
+        # Final fallback: month start to today (utility calendar)
+        now = self._utility_today()
         start = date(now.year, now.month, 1)
         return BillingCycle(start=start, end=now)
 
@@ -271,6 +317,25 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         allow_initialize_missing: bool = False,
     ) -> None:
         """Manually process one backfill cycle."""
+        if not self._try_begin_backfill("manual one-cycle backfill"):
+            return
+        try:
+            await self._run_backfill_unlocked(
+                overwrite=overwrite,
+                cycle_key=cycle_key,
+                allow_initialize_missing=allow_initialize_missing,
+            )
+        finally:
+            self._end_backfill()
+
+    async def _run_backfill_unlocked(
+        self,
+        *,
+        overwrite: bool = False,
+        cycle_key: str | None = None,
+        allow_initialize_missing: bool = False,
+    ) -> None:
+        """One-cycle backfill body (caller must hold the busy lock)."""
         _LOGGER.debug(
             "Manual backfill requested: entry=%s overwrite=%s cycle_key=%s",
             self.config_entry.entry_id,
@@ -296,6 +361,15 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
     async def async_run_backfill_all(self, overwrite: bool = False) -> None:
         """Manually process all incomplete backfill cycles."""
+        if not self._try_begin_backfill("manual full backfill"):
+            return
+        try:
+            await self._run_backfill_all_unlocked(overwrite=overwrite)
+        finally:
+            self._end_backfill()
+
+    async def _run_backfill_all_unlocked(self, *, overwrite: bool = False) -> None:
+        """Full backfill body (caller must hold the busy lock)."""
         _LOGGER.debug(
             "Manual full backfill requested: entry=%s overwrite=%s",
             self.config_entry.entry_id,
@@ -344,16 +418,15 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 self.config_entry.entry_id,
             )
             return
-        if getattr(self, "_initial_backfill_running", False):
+        if not self._try_begin_backfill("initial historical backfill"):
             return
 
-        self._initial_backfill_running = True
         _LOGGER.info(
             "Starting one-time initial historical backfill for entry=%s",
             self.config_entry.entry_id,
         )
         try:
-            await self.async_run_backfill_all(overwrite=False)
+            await self._run_backfill_all_unlocked(overwrite=False)
             # Also pull electricity from install → now so current cycle is filled.
             await self.async_sync_electricity_catchup(full_since_install=True)
             self._state["initial_backfill_done"] = True
@@ -370,7 +443,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 err,
             )
         finally:
-            self._initial_backfill_running = False
+            self._end_backfill()
 
     async def async_sync_electricity_catchup(self, *, full_since_install: bool = True) -> None:
         """Fill electricity (and cost) from install/watermark → now without deep re-backfill.
@@ -383,7 +456,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         await self._ensure_authenticated()
         self._ensure_installed_at()
 
-        today = datetime.now().date()
+        today = self._utility_today()
         installed = self._installed_at_date()
         lookback = int(
             self.config_entry.options.get(
@@ -425,7 +498,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         await self._sync_monthly_external_statistics(force_rewrite=False)
         self._apply_monotonic_guard()
 
-        catchup["last_run"] = datetime.now().astimezone().isoformat()
+        catchup["last_run"] = self._utility_now().isoformat()
         catchup["watermark_date"] = today.isoformat()
         self._set_last_sync()
         await self._save_state()
@@ -508,21 +581,34 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 self._state["bill_projection"] = bill_projection
             except Exception as err:  # pylint: disable=broad-except
                 _LOGGER.warning("Could not fetch bill_projection: %s", err)
-            await self._process_intervals(datetime.now())
-            await self._daily_reconcile(datetime.now().date())
+            utility_now = self._utility_now()
+            await self._process_intervals(utility_now)
+            await self._daily_reconcile(utility_now.date())
             await self._monthly_reconcile()
             # Process at most one missing backfill cycle per scheduled update
             # (initial install also drains the full queue via async_maybe_run_initial_backfill).
-            await self._process_backfill(overwrite=False)
+            # Hold the busy lock so the Run Backfill button stays unavailable.
+            if self._try_begin_backfill("scheduled one-cycle backfill"):
+                try:
+                    await self._process_backfill(overwrite=False)
+                finally:
+                    self._end_backfill()
+            # else: a manual/initial backfill is already running; skip this poll's cycle
             # One-time migration: clear auto-compiled recorder rows that
             # conflict with our imported statistics after state_class removal.
             force_rewrite = self._check_statistics_migration()
             # One-time fix: re-create external statistics with proper unit_class
             force_rewrite = self._check_unit_class_fix() or force_rewrite
+            force_rewrite = bool(self._state.pop("_force_stats_rewrite", False)) or force_rewrite
             await self._sync_external_statistics(force_rewrite=force_rewrite)
             await self._sync_hourly_external_statistics(force_rewrite=force_rewrite)
             await self._sync_monthly_external_statistics(force_rewrite=force_rewrite)
-            # Once-per-day electricity catch-up since install/watermark (not deep history).
+            # Cadence:
+            # - hourly/daily series: commit each completed hour
+            # - monthly series: commit only after a month ends
+            # - once-per-day catch-up still fills gaps since install watermark
+            await self._maybe_hourly_electric_catchup()
+            await self._maybe_monthly_electric_catchup()
             await self._maybe_daily_electric_catchup()
             self._apply_monotonic_guard()
             # Update last_sync timestamp for scheduled/automatic update
@@ -633,6 +719,30 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             f"sensor.{base}_gas_cumulative_cost",
         ]
 
+    def _option_bool(self, key: str, default: bool) -> bool:
+        """Read a boolean from options, falling back to entry data then default."""
+        return bool(
+            self.config_entry.options.get(
+                key,
+                self.config_entry.data.get(key, default),
+            )
+        )
+
+    def _hourly_statistics_enabled(self) -> bool:
+        return self._option_bool(
+            CONF_ENABLE_HOURLY_STATISTICS, DEFAULT_ENABLE_HOURLY_STATISTICS
+        )
+
+    def _daily_statistics_enabled(self) -> bool:
+        return self._option_bool(
+            CONF_ENABLE_DAILY_STATISTICS, DEFAULT_ENABLE_DAILY_STATISTICS
+        )
+
+    def _monthly_statistics_enabled(self) -> bool:
+        return self._option_bool(
+            CONF_ENABLE_MONTHLY_STATISTICS, DEFAULT_ENABLE_MONTHLY_STATISTICS
+        )
+
     async def _sync_external_statistics(self, *, force_rewrite: bool = False) -> None:
         """Import historical daily usage into external dominionsc:* statistics with day timestamps.
 
@@ -641,6 +751,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         hourly statistics for sensors with state_class and can reset sum=0 after
         restarts; external statistics are completely independent of that process.
         """
+        if not self._daily_statistics_enabled():
+            _LOGGER.debug("Daily statistics sync skipped: disabled in options")
+            return
         try:
             from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
             from homeassistant.components.recorder.statistics import (  # pylint: disable=import-outside-toplevel
@@ -669,16 +782,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             imported_days = set(imported_days_raw if isinstance(imported_days_raw, list) else [])
 
             daily_points: list[tuple[date, float]] = []
-            today = datetime.now().date()
-            lookback_days = int(
-                self.config_entry.options.get(
-                    CONF_DAILY_LOOKBACK_DAYS,
-                    self.config_entry.data.get(
-                        CONF_DAILY_LOOKBACK_DAYS, DEFAULT_DAILY_LOOKBACK_DAYS,
-                    ),
-                )
-            )
-            lookback_cutoff = today - timedelta(days=max(1, lookback_days))
+            today = self._utility_today()
 
             for key, value in self._state.get(ledger_name, {}).items():
                 if not isinstance(key, str) or not key.startswith(f"{fuel_prefix}|"):
@@ -691,38 +795,21 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
                 consumption = max(float(value), 0.0) if value is not None else 0.0
 
-                # Skip today and future dates — data is never ready yet
-                if day >= today:
+                # Skip future dates. Today is allowed so the daily Energy series
+                # can update at each completed hour (progressive in-day total).
+                if day > today:
                     _LOGGER.debug(
-                        "Statistics sync filtering today/future date: %s=%s (%s)",
+                        "Statistics sync filtering future date: %s=%s (%s)",
                         key, consumption, series_key,
                     )
                     continue
 
-                # Skip recent null/zero rows — Dominion data may arrive later
-                # via the lag-safe lookback window
-                if day >= lookback_cutoff and consumption == 0.0:
+                # Zeros stay null — never import a 0 statistic point.
+                if consumption == 0.0:
                     _LOGGER.debug(
-                        "Statistics sync filtering recent zero row "
-                        "(data may arrive later): %s (%s)",
-                        key, series_key,
-                    )
-                    continue
-
-                # For finalized dates: skip zero electric consumption
-                # (true zero essentially impossible — HA itself draws power).
-                # Trust zero for gas (legitimate in summer) and all cost series.
-                is_cost_series = "_cost" in series_key
-                if (
-                    day < lookback_cutoff
-                    and consumption == 0.0
-                    and fuel_prefix == "electric"
-                    and not is_cost_series
-                ):
-                    _LOGGER.debug(
-                        "Statistics sync filtering finalized zero electric "
-                        "consumption (likely data gap): %s",
+                        "Statistics sync filtering zero row (null): %s (%s)",
                         key,
+                        series_key,
                     )
                     continue
 
@@ -822,7 +909,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                     continue
                 to_import.append(
                     StatisticData(
-                        start=datetime.combine(day, time.min, tzinfo=UTC),
+                        start=self._local_midnight(day),
                         state=running_sum,
                         sum=running_sum,
                     )
@@ -837,13 +924,13 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 _LOGGER.debug("Statistics sync no-op for %s: nothing new to import", series_key)
                 continue
 
-            # Build a human-friendly name for the metadata
+            # Label explicitly as Daily so Energy Dashboard shows Hourly/Daily/Monthly.
             friendly_label = series_key.replace("_", " ").title()
             metadata = StatisticMetaData(
                 has_mean=False,
                 mean_type=StatisticMeanType.NONE,
                 has_sum=True,
-                name=f"Dominion SC {friendly_label}",
+                name=f"Dominion SC Daily {friendly_label}",
                 source=DOMAIN,
                 statistic_id=statistic_id,
                 unit_class=unit_class,
@@ -873,6 +960,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
     async def _sync_hourly_external_statistics(self, *, force_rewrite: bool = False) -> None:
         """Import interval ledger rows as hour-aligned external statistics."""
+        if not self._hourly_statistics_enabled():
+            _LOGGER.debug("Hourly statistics sync skipped: disabled in options")
+            return
         try:
             from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
             from homeassistant.components.recorder.statistics import (  # pylint: disable=import-outside-toplevel
@@ -893,6 +983,11 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             ("gas_cost", TOTAL_GAS_COST, "$", "interval_cost_ledger", None),
         ]
 
+        # Only commit completed hours — never the in-progress hour (utility local).
+        local_tz = self._local_tz()
+        now_local = self._utility_now()
+        current_hour_start = now_local.replace(minute=0, second=0, microsecond=0)
+
         for series_key, total_key, unit, ledger_name, unit_class in fuel_config:
             fuel_prefix = series_key.replace("_cost", "")
             statistic_id = self.get_hourly_statistic_id(total_key)
@@ -902,14 +997,23 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             hourly_points = self._aggregate_interval_ledger_to_hours(
                 self._state.get(ledger_name, {}) or {},
                 fuel_prefix=fuel_prefix,
+                tz=local_tz,
             )
-            if not hourly_points:
-                _LOGGER.debug("Hourly statistics sync skipped for %s: no points", series_key)
+            completed_points = [
+                (hour_start, consumption)
+                for hour_start, consumption in hourly_points
+                if hour_start < current_hour_start and consumption > 0.0
+            ]
+            if not completed_points:
+                _LOGGER.debug(
+                    "Hourly statistics sync skipped for %s: no completed hours yet",
+                    series_key,
+                )
                 continue
 
             imported_raw = statistics_state.setdefault(series_key, [])
             imported_hours = set(imported_raw if isinstance(imported_raw, list) else [])
-            point_hour_set = {dt.isoformat() for dt, _ in hourly_points}
+            point_hour_set = {dt.isoformat() for dt, _ in completed_points}
             rewrite_for_fuel = force_rewrite
             if not rewrite_for_fuel and imported_hours:
                 if any(key not in point_hour_set for key in imported_hours):
@@ -917,7 +1021,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 else:
                     max_imported = max(imported_hours)
                     precompute_sum = 0.0
-                    for hour_start, consumption in hourly_points:
+                    for hour_start, consumption in completed_points:
                         precompute_sum += consumption
                         if hour_start.isoformat() == max_imported:
                             break
@@ -932,7 +1036,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
             running_sum = 0.0
             to_import: list[StatisticData] = []
-            for hour_start, consumption in hourly_points:
+            for hour_start, consumption in completed_points:
                 running_sum += consumption
                 hour_key = hour_start.isoformat()
                 if hour_key in imported_hours:
@@ -973,6 +1077,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
     async def _sync_monthly_external_statistics(self, *, force_rewrite: bool = False) -> None:
         """Import monthly ledger rows into external monthly statistics."""
+        if not self._monthly_statistics_enabled():
+            _LOGGER.debug("Monthly statistics sync skipped: disabled in options")
+            return
         try:
             from homeassistant.components.recorder import get_instance  # pylint: disable=import-outside-toplevel
             from homeassistant.components.recorder.statistics import (  # pylint: disable=import-outside-toplevel
@@ -992,7 +1099,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             ("electric_cost", TOTAL_ELECTRIC_COST, "$", "monthly_cost_ledger", None),
             ("gas_cost", TOTAL_GAS_COST, "$", "monthly_cost_ledger", None),
         ]
-        now_month = date(datetime.now().year, datetime.now().month, 1)
+        utility_today = self._utility_today()
+        now_month = date(utility_today.year, utility_today.month, 1)
 
         for series_key, total_key, unit, ledger_name, unit_class in fuel_config:
             fuel_prefix = series_key.replace("_cost", "")
@@ -1013,7 +1121,11 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 # Skip the in-progress month — usage/cost are still changing.
                 if month_start >= now_month:
                     continue
-                monthly_points.append((month_start, max(float(value or 0.0), 0.0)))
+                consumption = max(float(value or 0.0), 0.0)
+                # Zeros stay null — no monthly statistic entry for 0.
+                if consumption == 0.0:
+                    continue
+                monthly_points.append((month_start, consumption))
 
             if not monthly_points:
                 _LOGGER.debug("Monthly statistics sync skipped for %s: no points", series_key)
@@ -1052,7 +1164,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                     continue
                 to_import.append(
                     StatisticData(
-                        start=datetime.combine(month_start, time.min, tzinfo=UTC),
+                        start=self._local_midnight(month_start),
                         state=running_sum,
                         sum=running_sum,
                     )
@@ -1084,16 +1196,43 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 len(statistics_state[series_key]),
             )
 
-    @staticmethod
-    def _parse_interval_end_datetime(interval_end: str) -> datetime | None:
-        """Parse Bidgely intervalEndDate into a timezone-aware datetime (UTC)."""
+    def _local_tz(self) -> ZoneInfo:
+        """Dominion Bidgely wall-clock timezone (America/New_York).
+
+        Always Eastern — not Home Assistant's configured timezone — so hour and
+        calendar-day keys match the utility portal even when the HA host is UTC
+        or another zone.
+        """
+        return _DEFAULT_UTILITY_TZ
+
+    def _utility_now(self) -> datetime:
+        """Current time in the Dominion utility timezone."""
+        return datetime.now(self._local_tz())
+
+    def _utility_today(self) -> date:
+        """Current calendar day in the Dominion utility timezone."""
+        return self._utility_now().date()
+
+    def _local_midnight(self, day: date) -> datetime:
+        """Start of calendar day in utility local time (Energy day alignment)."""
+        return datetime.combine(day, time.min, tzinfo=self._local_tz())
+
+    @classmethod
+    def _parse_interval_end_datetime(
+        cls,
+        interval_end: str,
+        *,
+        tz: ZoneInfo | None = None,
+    ) -> datetime | None:
+        """Parse Bidgely intervalEndDate as utility-local wall clock (not UTC)."""
         text = str(interval_end).strip()
         if not text:
             return None
+        local_tz = tz or _DEFAULT_UTILITY_TZ
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
             try:
                 parsed = datetime.strptime(text, fmt)
-                return parsed.replace(tzinfo=UTC)
+                return parsed.replace(tzinfo=local_tz)
             except ValueError:
                 continue
         try:
@@ -1101,8 +1240,95 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         except ValueError:
             return None
         if parsed.tzinfo is None:
-            return parsed.replace(tzinfo=UTC)
-        return parsed.astimezone(UTC)
+            return parsed.replace(tzinfo=local_tz)
+        return parsed.astimezone(local_tz)
+
+    @classmethod
+    def _day_key_from_bidgely_interval(
+        cls,
+        *,
+        interval_start: Any = None,
+        interval_end: Any = None,
+        tz: ZoneInfo | None = None,
+    ) -> str | None:
+        """Map Bidgely interval bounds to the portal calendar day.
+
+        Bidgely daily buckets commonly use an exclusive midnight ``intervalEnd``
+        (e.g. usage for Nov 15 ends at ``2026-11-16 00:00:00``). Using the end
+        date token alone stores the next day — one day ahead of the portal.
+        Prefer ``intervalStart`` when present; otherwise treat exact midnight
+        ends as belonging to the previous calendar day.
+        """
+        local_tz = tz or _DEFAULT_UTILITY_TZ
+        if interval_start not in (None, ""):
+            parsed_start = cls._parse_interval_end_datetime(str(interval_start), tz=local_tz)
+            if parsed_start is not None:
+                return parsed_start.date().isoformat()
+
+        if interval_end in (None, ""):
+            return None
+        parsed_end = cls._parse_interval_end_datetime(str(interval_end), tz=local_tz)
+        if parsed_end is None:
+            text = str(interval_end).strip()
+            return text.split(" ")[0] if text else None
+
+        if (
+            parsed_end.hour == 0
+            and parsed_end.minute == 0
+            and parsed_end.second == 0
+            and parsed_end.microsecond == 0
+        ):
+            return (parsed_end.date() - timedelta(days=1)).isoformat()
+        return parsed_end.date().isoformat()
+
+    def _migrate_day_ahead_and_utc_stats(self) -> None:
+        """Shift historical daily ledger keys back one day and force stats rewrite."""
+        if self._state.get("day_key_midnight_fix_applied"):
+            return
+
+        shifted = 0
+        for ledger_name in ("daily_ledger", "daily_cost_ledger"):
+            old_ledger = self._state.get(ledger_name, {}) or {}
+            if not isinstance(old_ledger, dict) or not old_ledger:
+                continue
+            new_ledger: dict[str, Any] = {}
+            for key, value in old_ledger.items():
+                if not isinstance(key, str) or "|" not in key:
+                    new_ledger[key] = value
+                    continue
+                fuel, day_str = key.split("|", 1)
+                try:
+                    day = date.fromisoformat(day_str) - timedelta(days=1)
+                except ValueError:
+                    new_ledger[key] = value
+                    continue
+                new_key = f"{fuel}|{day.isoformat()}"
+                # Prefer the shifted key; if collision, keep the larger value.
+                if new_key in new_ledger:
+                    new_ledger[new_key] = max(float(new_ledger[new_key] or 0.0), float(value or 0.0))
+                else:
+                    new_ledger[new_key] = value
+                shifted += 1
+            self._state[ledger_name] = new_ledger
+
+        # Reset import tracking so local-midnight timestamps replace UTC points.
+        for stats_key in (
+            "statistics_import",
+            "hourly_statistics_import",
+            "monthly_statistics_import",
+        ):
+            self._state[stats_key] = {}
+
+        self._state["day_key_midnight_fix_applied"] = True
+        self._state["_force_stats_rewrite"] = True
+        try:
+            self._recompute_totals_from_ledgers()
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not recompute totals after day-key migration", exc_info=True)
+        _LOGGER.info(
+            "Applied day-ahead ledger fix: shifted=%s daily keys; stats rewrite queued",
+            shifted,
+        )
 
     @classmethod
     def _aggregate_interval_ledger_to_hours(
@@ -1110,14 +1336,16 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         ledger: dict[str, Any],
         *,
         fuel_prefix: str,
+        tz: ZoneInfo | None = None,
     ) -> list[tuple[datetime, float]]:
         """Bucket sub-hourly interval rows into hour-start cumulative-ready points."""
+        local_tz = tz or _DEFAULT_UTILITY_TZ
         buckets: dict[datetime, float] = {}
         for key, value in ledger.items():
             if not isinstance(key, str) or not key.startswith(f"{fuel_prefix}|"):
                 continue
             interval_end = key.split("|", 1)[1]
-            parsed = cls._parse_interval_end_datetime(interval_end)
+            parsed = cls._parse_interval_end_datetime(interval_end, tz=local_tz)
             if parsed is None:
                 continue
             # Interval end belongs to the preceding hour bucket when exact hour.
@@ -1176,15 +1404,136 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         start = now_dt - timedelta(hours=max(1, lookback_hours))
         await self._store_interval_window(start, now_dt, electric_only=False)
 
-    async def _maybe_daily_electric_catchup(self) -> None:
-        """Run incremental electricity catch-up at most once per local calendar day."""
-        enabled = bool(
+    async def _maybe_hourly_electric_catchup(self) -> None:
+        """Commit completed-hour electricity into hourly + progressive daily series.
+
+        Runs once per completed hour (poll may be every 15m; watermark prevents
+        repeats). Monthly series are intentionally not updated here.
+        """
+        if not self._hourly_statistics_enabled() and not self._daily_statistics_enabled():
+            return
+        if not self._state.get("initial_backfill_done"):
+            return
+
+        local_tz = self._local_tz()
+        now = self._utility_now()
+        current_hour_start = now.replace(minute=0, second=0, microsecond=0)
+        last_completed = current_hour_start - timedelta(hours=1)
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None, "last_hour_watermark": None},
+        )
+        if catchup.get("last_hour_watermark") == last_completed.isoformat():
+            return
+
+        lookback_hours = int(
             self.config_entry.options.get(
-                CONF_DAILY_ELECTRIC_CATCHUP,
+                CONF_INTERVAL_LOOKBACK_HOURS,
                 self.config_entry.data.get(
-                    CONF_DAILY_ELECTRIC_CATCHUP, DEFAULT_DAILY_ELECTRIC_CATCHUP
+                    CONF_INTERVAL_LOOKBACK_HOURS, DEFAULT_INTERVAL_LOOKBACK_HOURS
                 ),
             )
+        )
+        window_start = last_completed - timedelta(hours=max(1, lookback_hours - 1))
+        try:
+            await self._store_interval_window(
+                window_start,
+                now,
+                electric_only=True,
+                overwrite=True,
+            )
+            self._rollup_today_daily_from_completed_hours()
+            # Exclusive midnight end (D+1 00:00) closes D's 23:00 hour. Once that
+            # hour completes, refresh D from mode=month so the daily series gets
+            # the full portal day — not a short interval lookback overwrite.
+            if last_completed.hour == 23:
+                completed_day = last_completed.date()
+                await self._catchup_electric_daily(completed_day, completed_day)
+            if self._hourly_statistics_enabled():
+                await self._sync_hourly_external_statistics(force_rewrite=False)
+            if self._daily_statistics_enabled():
+                await self._sync_external_statistics(force_rewrite=False)
+            catchup["last_hour_watermark"] = last_completed.isoformat()
+            _LOGGER.info(
+                "Hourly electricity catch-up committed hour ending %s",
+                current_hour_start.isoformat(),
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Hourly electricity catch-up failed: %s", err)
+
+    async def _maybe_monthly_electric_catchup(self) -> None:
+        """When the calendar month rolls, import the completed prior month once."""
+        if not self._monthly_statistics_enabled():
+            return
+        if not self._state.get("initial_backfill_done"):
+            return
+
+        now = self._utility_today()
+        current_month = date(now.year, now.month, 1)
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None, "last_month_watermark": None},
+        )
+        last_month_raw = catchup.get("last_month_watermark")
+        try:
+            last_month = date.fromisoformat(str(last_month_raw)) if last_month_raw else None
+        except ValueError:
+            last_month = None
+
+        # First run: stamp current month without forcing a sync (prior months
+        # already come from monthly reconcile / initial backfill).
+        if last_month is None:
+            catchup["last_month_watermark"] = current_month.isoformat()
+            return
+        if last_month >= current_month:
+            return
+
+        try:
+            await self._monthly_reconcile()
+            await self._sync_monthly_external_statistics(force_rewrite=False)
+            catchup["last_month_watermark"] = current_month.isoformat()
+            _LOGGER.info(
+                "Monthly electricity catch-up imported completed month before %s",
+                current_month.isoformat(),
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning("Monthly electricity catch-up failed: %s", err)
+
+    def _rollup_today_daily_from_completed_hours(self) -> None:
+        """Set today's daily electric ledger from sum of completed hours so far."""
+        local_tz = self._local_tz()
+        now_local = self._utility_now()
+        today = now_local.date()
+        current_hour_start = now_local.replace(minute=0, second=0, microsecond=0)
+
+        usage_hours = self._aggregate_interval_ledger_to_hours(
+            self._state.get("interval_ledger", {}) or {},
+            fuel_prefix="electric",
+            tz=local_tz,
+        )
+        cost_hours = self._aggregate_interval_ledger_to_hours(
+            self._state.get("interval_cost_ledger", {}) or {},
+            fuel_prefix="electric",
+            tz=local_tz,
+        )
+        usage_sum = sum(
+            value
+            for hour_start, value in usage_hours
+            if hour_start.date() == today and hour_start < current_hour_start
+        )
+        cost_sum = sum(
+            value
+            for hour_start, value in cost_hours
+            if hour_start.date() == today and hour_start < current_hour_start
+        )
+        day_key = today.isoformat()
+        self._upsert_daily(f"electric|{day_key}", usage_sum, True, TOTAL_ELECTRIC_KWH)
+        self._upsert_daily_cost(f"electric|{day_key}", cost_sum, True, TOTAL_ELECTRIC_COST)
+
+    async def _maybe_daily_electric_catchup(self) -> None:
+        """Run incremental electricity catch-up at most once per local calendar day."""
+        enabled = self._option_bool(
+            CONF_DAILY_ELECTRIC_CATCHUP, DEFAULT_DAILY_ELECTRIC_CATCHUP
         )
         if not enabled:
             return
@@ -1198,7 +1547,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             "electric_catchup",
             {"last_run": None, "watermark_date": None},
         )
-        today = datetime.now().date()
+        today = self._utility_today()
         last_run_raw = catchup.get("last_run")
         if last_run_raw:
             try:
@@ -1261,8 +1610,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             max(1, (end - start).days + 1),
         )
         window_start_date = max(start, end - timedelta(days=hourly_days - 1))
-        start_dt = datetime.combine(window_start_date, time.min)
-        end_dt = datetime.combine(end, time.max)
+        utility_tz = self._local_tz()
+        start_dt = datetime.combine(window_start_date, time.min, tzinfo=utility_tz)
+        end_dt = datetime.combine(end, time.max, tzinfo=utility_tz)
         await self._store_interval_window(start_dt, end_dt, electric_only=True)
 
     async def _store_interval_window(
@@ -1271,6 +1621,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         end: datetime,
         *,
         electric_only: bool,
+        overwrite: bool = False,
     ) -> None:
         """Persist Bidgely mode=day interval rows into interval ledgers."""
         electric_payload = await self.hass.async_add_executor_job(
@@ -1306,19 +1657,35 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             e_key = f"electric|{interval_end}"
             g_key = f"gas|{interval_end}"
 
-            if e_key not in self._state["interval_ledger"]:
-                self._state["interval_ledger"][e_key] = float(row["electric_usage_kwh"])
-                self._state["stats"]["accepted_interval_rows"] += 1
-            if e_key not in self._state["interval_cost_ledger"]:
-                self._state["interval_cost_ledger"][e_key] = float(row["electric_cost"])
+            self._store_interval_value(
+                self._state["interval_ledger"],
+                e_key,
+                float(row["electric_usage_kwh"]),
+                overwrite,
+                count_accepted=True,
+            )
+            self._store_interval_value(
+                self._state["interval_cost_ledger"],
+                e_key,
+                float(row["electric_cost"]),
+                overwrite,
+            )
 
             if electric_only:
                 continue
 
-            if g_key not in self._state["interval_ledger"]:
-                self._state["interval_ledger"][g_key] = float(row["gas_usage_ccf"]) * 100.0
-            if g_key not in self._state["interval_cost_ledger"]:
-                self._state["interval_cost_ledger"][g_key] = float(row["gas_cost"])
+            self._store_interval_value(
+                self._state["interval_ledger"],
+                g_key,
+                float(row["gas_usage_ccf"]) * 100.0,
+                overwrite,
+            )
+            self._store_interval_value(
+                self._state["interval_cost_ledger"],
+                g_key,
+                float(row["gas_cost"]),
+                overwrite,
+            )
 
     def _ensure_installed_at(self) -> None:
         """Persist the first-seen integration timestamp once."""
@@ -1599,7 +1966,16 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         """Derive YYYY-MM from a Bidgely monthly interval end value."""
         parsed = cls._parse_interval_end_datetime(interval_end)
         if parsed is not None:
-            return f"{parsed.year:04d}-{parsed.month:02d}"
+            day = parsed.date()
+            # Exclusive midnight ends belong to the previous calendar day/month.
+            if (
+                parsed.hour == 0
+                and parsed.minute == 0
+                and parsed.second == 0
+                and parsed.microsecond == 0
+            ):
+                day = day - timedelta(days=1)
+            return f"{day.year:04d}-{day.month:02d}"
         text = str(interval_end).strip()
         if len(text) >= 7 and text[4] == "-":
             candidate = text[:7]
@@ -1678,25 +2054,43 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         _LOGGER.debug("Backfill cycle selected: %s (overwrite=%s)", cycle.key, overwrite)
 
         rows = await self._fetch_daily_rows(cycle.start, cycle.end)
-        if not rows:
+        in_range_rows = self._filter_rows_to_date_range(rows, cycle.start, cycle.end)
+        if not in_range_rows:
+            # Do not permanently complete empty cycles — Bidgely often returns the
+            # wrong billing window when skip_ongoing is forced. Retry later.
+            attempts = self._state.setdefault("backfill_empty_attempts", {})
+            attempt_n = int(attempts.get(cycle.key, 0)) + 1
+            attempts[cycle.key] = attempt_n
             _LOGGER.warning(
-                "Backfill cycle %s returned no rows — marking as complete to avoid infinite retries. "
-                "Check API or payload availability.",
-                cycle.key
+                "Backfill cycle %s returned no in-range rows (raw=%s attempt=%s/%s)",
+                cycle.key,
+                len(rows),
+                attempt_n,
+                5,
             )
-            # Even if no rows returned, mark this cycle as complete to prevent stuck retries
-            backfill = self._state["backfill"]
-            if cycle.key in backfill["missing_cycles"]:
-                backfill["missing_cycles"].remove(cycle.key)
-            if cycle.key not in backfill["completed_cycles"]:
-                backfill["completed_cycles"].append(cycle.key)
-                backfill["cycles_completed"] += 1
+            if attempt_n >= 5:
+                backfill = self._state["backfill"]
+                if cycle.key in backfill["missing_cycles"]:
+                    backfill["missing_cycles"].remove(cycle.key)
+                if cycle.key not in backfill["completed_cycles"]:
+                    backfill["completed_cycles"].append(cycle.key)
+                    backfill["cycles_completed"] += 1
+                _LOGGER.warning(
+                    "Backfill cycle %s marked complete after %s empty attempts",
+                    cycle.key,
+                    attempt_n,
+                )
             return
 
-        today = datetime.now().date()
-        _LOGGER.debug("Backfill cycle %s processing %s daily rows", cycle.key, len(rows))
+        today = self._utility_today()
+        _LOGGER.debug(
+            "Backfill cycle %s processing %s in-range daily rows (raw=%s)",
+            cycle.key,
+            len(in_range_rows),
+            len(rows),
+        )
 
-        for row in rows:
+        for row in in_range_rows:
             if self._is_future_placeholder(row, today):
                 _LOGGER.debug("Backfill skipping future zero-value placeholder row: %s", row.get("date"))
                 continue
@@ -1741,6 +2135,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         if cycle.key not in backfill["completed_cycles"]:
             backfill["completed_cycles"].append(cycle.key)
             backfill["cycles_completed"] += 1
+        # Clear empty-attempt counter on success
+        self._state.setdefault("backfill_empty_attempts", {}).pop(cycle.key, None)
         _LOGGER.debug(
             "Backfill cycle complete: %s cycles_completed=%s missing_remaining=%s",
             cycle.key,
@@ -1749,21 +2145,44 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         )
 
     async def _fetch_daily_rows(self, start: date, end: date) -> list[dict[str, float | str]]:
-        start_dt = datetime.combine(start, time.min, tzinfo=UTC)
-        end_dt = datetime.combine(end, time.max, tzinfo=UTC)
-        # If the requested end date is in the past (strictly before today) we
-        # are asking for a completed billing period / historical data. In that
-        # case request the "previous"/completed cycle from Bidgely by setting
-        # current_cycle=False (which maps to skip_ongoing_cycle=True). For any
-        # request that includes today or a future date, keep current_cycle=True
-        # so the ongoing active cycle is returned.
-        today = datetime.now().date()
-        current_cycle_flag = False if end < today else True
+        """Fetch Bidgely mode=month daily rows for an explicit date range.
 
+        Always prefer ``current_cycle=True`` (skip_ongoing_cycle=False) so the
+        Bidgely ``start``/``end`` window is honored. Forcing
+        ``current_cycle=False`` on historical calendar months often returns the
+        prior *billing* cycle (or empty), which does not match Oct 1–31 style
+        backfill windows and caused months to be marked complete with no data.
+
+        If the preferred fetch is empty, retry once with ``current_cycle=False``.
+        """
+        start_dt = datetime.combine(start, time.min, tzinfo=self._local_tz())
+        end_dt = datetime.combine(end, time.max, tzinfo=self._local_tz())
+
+        rows = await self._fetch_daily_rows_with_flag(
+            start_dt, end_dt, current_cycle=True
+        )
+        if not rows and end < self._utility_today():
+            _LOGGER.debug(
+                "Daily fetch empty for %s..%s with current_cycle=True; retrying current_cycle=False",
+                start.isoformat(),
+                end.isoformat(),
+            )
+            rows = await self._fetch_daily_rows_with_flag(
+                start_dt, end_dt, current_cycle=False
+            )
+        return rows
+
+    async def _fetch_daily_rows_with_flag(
+        self,
+        start_dt: datetime,
+        end_dt: datetime,
+        *,
+        current_cycle: bool,
+    ) -> list[dict[str, float | str]]:
         electric_payload = await self.hass.async_add_executor_job(
             lambda: self._client.get_daily_usage(
                 measurement_type="ELECTRIC",
-                current_cycle=current_cycle_flag,
+                current_cycle=current_cycle,
                 start=start_dt,
                 end=end_dt,
                 locale="en_US",
@@ -1772,45 +2191,79 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         gas_payload = await self.hass.async_add_executor_job(
             lambda: self._client.get_daily_usage(
                 measurement_type="GAS",
-                current_cycle=current_cycle_flag,
+                current_cycle=current_cycle,
                 start=start_dt,
                 end=end_dt,
                 locale="en_US",
             )
         )
 
-        # Temporary debug logging: show whether we requested the current
-        # cycle or the completed (previous) cycle and how many usage rows
-        # were returned for each fuel. This helps diagnose empty backfill
-        # payloads when running historical imports.
         try:
-            e_rows = (electric_payload.get("payload") or {}).get("usageChartDataList") or [] if isinstance(electric_payload, dict) else []
-            g_rows = (gas_payload.get("payload") or {}).get("usageChartDataList") or [] if isinstance(gas_payload, dict) else []
+            e_rows = (
+                (electric_payload.get("payload") or {}).get("usageChartDataList") or []
+                if isinstance(electric_payload, dict)
+                else []
+            )
+            g_rows = (
+                (gas_payload.get("payload") or {}).get("usageChartDataList") or []
+                if isinstance(gas_payload, dict)
+                else []
+            )
             _LOGGER.debug(
-                "Backfill fetch debug: start=%s end=%s current_cycle=%s electric_rows=%d gas_rows=%d",
-                start.isoformat(), end.isoformat(), current_cycle_flag, len(e_rows), len(g_rows),
+                "Daily fetch: start=%s end=%s current_cycle=%s electric_rows=%d gas_rows=%d",
+                start_dt.date().isoformat(),
+                end_dt.date().isoformat(),
+                current_cycle,
+                len(e_rows),
+                len(g_rows),
             )
         except Exception:  # Defensive: logging must not break processing
             _LOGGER.debug(
-                "Backfill fetch debug: start=%s end=%s current_cycle=%s (could not compute row counts)",
-                start.isoformat(), end.isoformat(), current_cycle_flag,
+                "Daily fetch: start=%s end=%s current_cycle=%s (could not compute row counts)",
+                start_dt.date().isoformat(),
+                end_dt.date().isoformat(),
+                current_cycle,
             )
+
         return self._merge_usage_rows(
             electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
             gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
         )
 
     @staticmethod
-    def _parse_usage_rows(payload: Any, fuel: str) -> list[dict[str, float | str]]:
+    def _filter_rows_to_date_range(
+        rows: list[dict[str, float | str]],
+        start: date,
+        end: date,
+    ) -> list[dict[str, float | str]]:
+        """Keep only rows whose parsed calendar day falls inside [start, end]."""
+        filtered: list[dict[str, float | str]] = []
+        for row in rows:
+            try:
+                row_date = date.fromisoformat(str(row["date"]))
+            except (ValueError, TypeError, KeyError):
+                continue
+            if start <= row_date <= end:
+                filtered.append(row)
+        return filtered
+
+    @classmethod
+    def _parse_usage_rows(cls, payload: Any, fuel: str) -> list[dict[str, float | str]]:
         rows: list[dict[str, float | str]] = []
         chart_rows: list[dict[str, Any]] = []
         if isinstance(payload, dict):
             chart_rows = (payload.get("payload") or {}).get("usageChartDataList") or []
 
         for row in chart_rows:
+            interval_start = row.get("intervalStartDate") or row.get("intervalStart")
             interval_end = row.get("intervalEndDate") or row.get("intervalEnd")
             interval_end_s = str(interval_end)
-            day_key = interval_end_s.split(" ")[0]
+            day_key = cls._day_key_from_bidgely_interval(
+                interval_start=interval_start,
+                interval_end=interval_end,
+            )
+            if not day_key:
+                continue
             consumption = max(float(row.get("consumption") or 0.0), 0.0)
             cost = max(float(row.get("cost") or 0.0), 0.0)
 
@@ -2003,9 +2456,37 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         self._state["unit_class_fix_applied"] = True
         return True
 
+    def _store_interval_value(
+        self,
+        ledger: dict[str, Any],
+        key: str,
+        value: float,
+        overwrite: bool,
+        *,
+        count_accepted: bool = False,
+    ) -> bool:
+        """Store a positive interval value; zeros stay null (no entry)."""
+        value = max(float(value), 0.0)
+        if value == 0.0:
+            if overwrite:
+                ledger.pop(key, None)
+            return False
+        if key not in ledger or overwrite:
+            if count_accepted and key not in ledger:
+                self._state["stats"]["accepted_interval_rows"] += 1
+            ledger[key] = value
+            return True
+        return False
+
     def _upsert_daily(self, key: str, value: float, overwrite: bool, total_key: str) -> None:
         value = max(float(value), 0.0)
         ledger = self._state["daily_ledger"]
+        # Zeros stay null — do not create (or keep) a 0 ledger entry.
+        if value == 0.0:
+            if overwrite and key in ledger:
+                old = float(ledger.pop(key))
+                self._state["totals"][total_key] -= old
+            return
         if key not in ledger:
             ledger[key] = value
             self._state["totals"][total_key] += value
@@ -2018,6 +2499,11 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
     def _upsert_daily_cost(self, key: str, value: float, overwrite: bool, total_key: str) -> None:
         value = max(float(value), 0.0)
         ledger = self._state["daily_cost_ledger"]
+        if value == 0.0:
+            if overwrite and key in ledger:
+                old = float(ledger.pop(key))
+                self._state["totals"][total_key] -= old
+            return
         if key not in ledger:
             ledger[key] = value
             self._state["totals"][total_key] += value
@@ -2030,12 +2516,20 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
     def _upsert_monthly(self, key: str, value: float, *, overwrite: bool) -> None:
         value = max(float(value), 0.0)
         ledger = self._state["monthly_ledger"]
+        if value == 0.0:
+            if overwrite:
+                ledger.pop(key, None)
+            return
         if key not in ledger or overwrite:
             ledger[key] = value
 
     def _upsert_monthly_cost(self, key: str, value: float, *, overwrite: bool) -> None:
         value = max(float(value), 0.0)
         ledger = self._state["monthly_cost_ledger"]
+        if value == 0.0:
+            if overwrite:
+                ledger.pop(key, None)
+            return
         if key not in ledger or overwrite:
             ledger[key] = value
 
@@ -2095,6 +2589,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             "monthly_statistics_import": {},
             "installed_at": None,
             "initial_backfill_done": False,
+            "day_key_midnight_fix_applied": False,
             "electric_catchup": {
                 "last_run": None,
                 "watermark_date": None,

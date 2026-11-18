@@ -11,6 +11,9 @@ CONF_BACKFILL_CYCLES_TARGET = "backfill_cycles_target"
 CONF_DAILY_LOOKBACK_DAYS = "daily_lookback_days"
 CONF_INTERVAL_LOOKBACK_HOURS = "interval_lookback_hours"
 CONF_DAILY_ELECTRIC_CATCHUP = "daily_electric_catchup"
+CONF_ENABLE_HOURLY_STATISTICS = "enable_hourly_statistics"
+CONF_ENABLE_DAILY_STATISTICS = "enable_daily_statistics"
+CONF_ENABLE_MONTHLY_STATISTICS = "enable_monthly_statistics"
 CONF_TFA_TOKEN = "tfa_token"
 
 DEFAULT_VERIFY_SSL = True
@@ -20,6 +23,9 @@ DEFAULT_DAILY_LOOKBACK_DAYS = 5
 # How far back each poll reaches for Bidgely mode=day (interval/hourly) rows.
 DEFAULT_INTERVAL_LOOKBACK_HOURS = 48
 DEFAULT_DAILY_ELECTRIC_CATCHUP = True
+DEFAULT_ENABLE_HOURLY_STATISTICS = True
+DEFAULT_ENABLE_DAILY_STATISTICS = True
+DEFAULT_ENABLE_MONTHLY_STATISTICS = True
 # Cap hourly API catch-up window so button/daily runs do not hammer Bidgely.
 DEFAULT_CATCHUP_HOURLY_DAYS = 7
 

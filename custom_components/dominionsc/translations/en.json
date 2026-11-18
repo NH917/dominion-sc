@@ -49,12 +49,18 @@
           "poll_minutes": "Polling interval",
           "backfill_cycles_target": "Backfill cycle target",
           "daily_lookback_days": "Daily reconcile lookback days",
+          "enable_hourly_statistics": "Enable hourly statistics",
+          "enable_daily_statistics": "Enable daily statistics",
+          "enable_monthly_statistics": "Enable monthly statistics",
           "daily_electric_catchup": "Daily electricity catch-up"
         },
         "data_description": {
           "poll_minutes": "How often to poll Dominion for new data (in minutes).",
           "backfill_cycles_target": "Number of most recent completed billing cycles to backfill. Increasing this adds unfilled cycles to the backfill queue.",
           "daily_lookback_days": "Number of days to look back during daily reconciliation to catch late-arriving data.",
+          "enable_hourly_statistics": "Publish Dominion SC Hourly usage/cost in Energy Dashboard (updates each completed hour).",
+          "enable_daily_statistics": "Publish Dominion SC Daily usage/cost in Energy Dashboard (updates each completed hour for today; finalized days from Bidgely).",
+          "enable_monthly_statistics": "Publish Dominion SC Monthly usage/cost in Energy Dashboard (updates after each month ends).",
           "daily_electric_catchup": "Once per day, refresh electricity usage/cost from the catch-up watermark (since install) without re-running deep historical backfill."
         }
       }

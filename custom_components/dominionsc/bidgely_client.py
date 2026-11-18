@@ -5,10 +5,16 @@ import time
 from dataclasses import dataclass
 from datetime import datetime, timezone, date, time as dt_time
 from typing import Any, Dict, List, Optional, Union, TYPE_CHECKING
+from zoneinfo import ZoneInfo
 
 import requests
 
 _LOGGER = logging.getLogger(__name__)
+
+# Dominion SC Bidgely chart timestamps are Eastern wall-clock values.
+# Naive datetime/date args must not be treated as UTC or interval windows
+# slide by several hours and land on the wrong day.
+_UTILITY_TZ = ZoneInfo("America/New_York")
 
 if TYPE_CHECKING:
     # Avoid a runtime import cycle: the dominion_sc_client module imports
@@ -111,10 +117,10 @@ class BidgelyClient:
             return int(value)
         if isinstance(value, datetime):
             if value.tzinfo is None:
-                value = value.replace(tzinfo=timezone.utc)
+                value = value.replace(tzinfo=_UTILITY_TZ)
             return int(value.timestamp())
         if isinstance(value, date):
-            dt = datetime.combine(value, dt_time.min, tzinfo=timezone.utc)
+            dt = datetime.combine(value, dt_time.min, tzinfo=_UTILITY_TZ)
             return int(dt.timestamp())
         raise TypeError(f"Unsupported datetime value: {type(value)!r}")
 

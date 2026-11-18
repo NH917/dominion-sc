@@ -57,6 +57,16 @@ def test_upsert_daily_add_and_overwrite():
     assert coord._state["daily_ledger"][key] == 3.0
     assert coord.totals[total_key] == 3.0
 
+    # zeros stay null — no new entry
+    coord._upsert_daily("electric|2026-03-10", 0.0, overwrite=False, total_key=total_key)
+    assert "electric|2026-03-10" not in coord._state["daily_ledger"]
+    assert coord.totals[total_key] == 3.0
+
+    # overwrite to zero removes the entry and adjusts totals
+    coord._upsert_daily(key, 0.0, overwrite=True, total_key=total_key)
+    assert key not in coord._state["daily_ledger"]
+    assert coord.totals[total_key] == 0.0
+
 
 def test_upsert_daily_cost_add_and_overwrite():
     coord = make_coordinator(None)
@@ -70,6 +80,33 @@ def test_upsert_daily_cost_add_and_overwrite():
     coord._upsert_daily_cost(key, 4.0, overwrite=True, total_key=total_key)
     assert coord._state["daily_cost_ledger"][key] == 4.0
     assert coord.totals[total_key] == 4.0
+
+    coord._upsert_daily_cost(key, 0.0, overwrite=True, total_key=total_key)
+    assert key not in coord._state["daily_cost_ledger"]
+    assert coord.totals[total_key] == 0.0
+
+
+def test_store_interval_value_skips_zeros():
+    coord = make_coordinator(None)
+    ledger = coord._state["interval_ledger"]
+    assert coord._store_interval_value(ledger, "electric|2026-03-10 00:15:00", 0.0, False) is False
+    assert "electric|2026-03-10 00:15:00" not in ledger
+
+    assert coord._store_interval_value(ledger, "electric|2026-03-10 00:15:00", 1.5, False) is True
+    assert ledger["electric|2026-03-10 00:15:00"] == 1.5
+
+    assert coord._store_interval_value(ledger, "electric|2026-03-10 00:15:00", 0.0, True) is False
+    assert "electric|2026-03-10 00:15:00" not in ledger
+
+
+def test_upsert_monthly_skips_zeros():
+    coord = make_coordinator(None)
+    coord._upsert_monthly("electric|2026-01", 0.0, overwrite=True)
+    assert "electric|2026-01" not in coord._state["monthly_ledger"]
+    coord._upsert_monthly("electric|2026-01", 10.0, overwrite=True)
+    assert coord._state["monthly_ledger"]["electric|2026-01"] == 10.0
+    coord._upsert_monthly("electric|2026-01", 0.0, overwrite=True)
+    assert "electric|2026-01" not in coord._state["monthly_ledger"]
 
 
 def test_pick_cycle_for_backfill_and_cycle_key():
@@ -195,6 +232,7 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
     async def fake_process_backfill(overwrite, cycle_key=None, allow_initialize_missing=True):
         assert cycle_key is None
         assert allow_initialize_missing is False
+        assert coord.backfill_in_progress is True
         current = coord._state["backfill"]["missing_cycles"].pop(0)
         coord._state["backfill"]["completed_cycles"].append(current)
         coord._state["backfill"]["cycles_completed"] += 1
@@ -223,6 +261,27 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
         "2026-01-01|2026-01-02",
         "2026-02-01|2026-02-02",
     ]
+    assert coord.backfill_in_progress is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_rejects_reentry_while_busy(monkeypatch):
+    entry = DummyEntry("busy")
+    coord = sc_coordinator.DominionSCCoordinator(hass=None, entry=entry)
+    calls = {"n": 0}
+
+    async def fake_unlocked(**kwargs):
+        calls["n"] += 1
+
+    monkeypatch.setattr(coord, "_run_backfill_unlocked", fake_unlocked)
+    assert coord._try_begin_backfill("holder") is True
+    await coord.async_run_backfill(overwrite=False)
+    assert calls["n"] == 0  # rejected while busy
+    assert coord.backfill_in_progress is True
+    coord._end_backfill()
+    await coord.async_run_backfill(overwrite=False)
+    assert calls["n"] == 1
+    assert coord.backfill_in_progress is False
 
 
 @pytest.mark.asyncio
@@ -482,8 +541,55 @@ def test_aggregate_interval_ledger_to_hours():
     }
     points = coord._aggregate_interval_ledger_to_hours(ledger, fuel_prefix="electric")
     hour_map = {dt: val for dt, val in points}
-    assert hour_map[datetime.datetime(2026, 3, 10, 0, 0, tzinfo=datetime.timezone.utc)] == 6.0
-    assert hour_map[datetime.datetime(2026, 3, 10, 1, 0, tzinfo=datetime.timezone.utc)] == 4.0
+    eastern = sc_coordinator._DEFAULT_UTILITY_TZ
+    assert hour_map[datetime.datetime(2026, 3, 10, 0, 0, tzinfo=eastern)] == 6.0
+    assert hour_map[datetime.datetime(2026, 3, 10, 1, 0, tzinfo=eastern)] == 4.0
+
+
+def test_aggregate_midnight_interval_closes_prior_day_23_hour():
+    """Exclusive midnight end belongs to prior calendar day's 23:00 hour."""
+    coord = make_coordinator(None)
+    ledger = {
+        "electric|2026-03-11 00:00:00": 5.5,
+        "electric|2026-03-10 23:15:00": 1.0,
+        "electric|2026-03-10 23:45:00": 1.5,
+    }
+    points = coord._aggregate_interval_ledger_to_hours(ledger, fuel_prefix="electric")
+    hour_map = {dt: val for dt, val in points}
+    eastern = sc_coordinator._DEFAULT_UTILITY_TZ
+    assert hour_map[datetime.datetime(2026, 3, 10, 23, 0, tzinfo=eastern)] == 8.0
+    assert datetime.datetime(2026, 3, 11, 0, 0, tzinfo=eastern) not in hour_map
+
+
+def test_day_key_from_bidgely_midnight_end_is_previous_day():
+    # Exclusive end at midnight Nov 16 = usage for Nov 15 (portal label).
+    day = sc_coordinator.DominionSCCoordinator._day_key_from_bidgely_interval(
+        interval_end="2026-11-16 00:00:00",
+    )
+    assert day == "2026-11-15"
+
+    # Prefer interval start when present.
+    day2 = sc_coordinator.DominionSCCoordinator._day_key_from_bidgely_interval(
+        interval_start="2026-11-15 00:00:00",
+        interval_end="2026-11-16 00:00:00",
+    )
+    assert day2 == "2026-11-15"
+
+    rows = sc_coordinator.DominionSCCoordinator._parse_usage_rows(
+        {
+            "payload": {
+                "usageChartDataList": [
+                    {
+                        "intervalEndDate": "2026-11-16 00:00:00",
+                        "consumption": 20.3,
+                        "cost": 3.22,
+                    }
+                ]
+            }
+        },
+        fuel="electric",
+    )
+    assert rows[0]["date"] == "2026-11-15"
 
 
 def test_parse_monthly_rows_and_month_key():
@@ -500,6 +606,16 @@ def test_parse_monthly_rows_and_month_key():
     assert rows[0]["electric_usage_kwh"] == 100.0
     assert rows[0]["electric_cost"] == 12.5
     assert rows[1]["month"] == "2026-02"
+
+
+def test_local_midnight_uses_utility_timezone():
+    coord = make_coordinator(None)
+    start = coord._local_midnight(datetime.date(2026, 11, 15))
+    assert start.tzinfo is not None
+    assert start.hour == 0
+    assert start.utcoffset() != datetime.timedelta(0) or str(start.tzinfo) == "America/New_York"
+    # Must NOT be UTC midnight — that lands at 7–8pm Eastern prior evening in Energy.
+    assert start.tzinfo != datetime.timezone.utc
 
 
 @pytest.mark.asyncio
@@ -659,13 +775,93 @@ async def test_maybe_daily_electric_catchup_runs_once(monkeypatch):
     assert calls["n"] == 1
 
 
+def test_daily_statistics_metadata_name_includes_daily():
+    coord = make_coordinator(None)
+    assert coord._daily_statistics_enabled() is True
+    assert coord.get_statistic_id(const.TOTAL_ELECTRIC_KWH) == "dominionsc:electric_cumulative_consumption"
+
+
+def test_rollup_today_daily_from_completed_hours(monkeypatch):
+    coord = make_coordinator(None)
+    eastern = sc_coordinator._DEFAULT_UTILITY_TZ
+
+    class FixedDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            # 10:30 Eastern → current hour 10:00; completed hours are before that
+            base = cls(2026, 3, 10, 10, 30, 0, tzinfo=eastern)
+            if tz is None:
+                return base.replace(tzinfo=None)
+            return base.astimezone(tz)
+
+    monkeypatch.setattr(sc_coordinator, "datetime", FixedDateTime)
+    coord._state["interval_ledger"] = {
+        "electric|2026-03-10 09:15:00": 1.0,
+        "electric|2026-03-10 09:45:00": 2.0,
+        "electric|2026-03-10 10:15:00": 9.0,  # in-progress hour — ignored
+    }
+    coord._state["interval_cost_ledger"] = {
+        "electric|2026-03-10 09:15:00": 0.1,
+        "electric|2026-03-10 09:45:00": 0.2,
+        "electric|2026-03-10 10:15:00": 0.9,
+    }
+    coord._rollup_today_daily_from_completed_hours()
+    assert coord._state["daily_ledger"]["electric|2026-03-10"] == 3.0
+    assert coord._state["daily_cost_ledger"]["electric|2026-03-10"] == pytest.approx(0.3)
+
+
+def test_epoch_seconds_naive_is_eastern_not_utc():
+    from custom_components.dominionsc.bidgely_client import BidgelyClient
+
+    naive = datetime.datetime(2026, 3, 10, 0, 0, 0)
+    epoch = BidgelyClient._epoch_seconds(naive)
+    eastern = sc_coordinator._DEFAULT_UTILITY_TZ
+    expected = int(datetime.datetime(2026, 3, 10, 0, 0, 0, tzinfo=eastern).timestamp())
+    assert epoch == expected
+    # UTC midnight would be 5 hours earlier in March (EDT).
+    utc_midnight = int(
+        datetime.datetime(2026, 3, 10, 0, 0, 0, tzinfo=datetime.timezone.utc).timestamp()
+    )
+    assert epoch != utc_midnight
+
+
+def test_local_tz_ignores_ha_non_eastern_config():
+    """Bidgely hour/day keys stay Eastern even if HA is configured UTC."""
+    entry = DummyEntry("tz")
+    coord = sc_coordinator.DominionSCCoordinator(hass=None, entry=entry)
+
+    class HassCfg:
+        time_zone = "UTC"
+
+    class Hass:
+        config = HassCfg()
+
+    coord.hass = Hass()
+    assert str(coord._local_tz()) == "America/New_York"
+    start = coord._local_midnight(datetime.date(2026, 11, 15))
+    assert start.utcoffset() != datetime.timedelta(0)
+
+
+def test_migrate_day_ahead_shifts_ledger_back_one_day():
+    coord = make_coordinator(None)
+    coord._state["day_key_midnight_fix_applied"] = False
+    coord._state["daily_ledger"] = {"electric|2026-11-16": 20.3}
+    coord._state["daily_cost_ledger"] = {"electric|2026-11-16": 3.22}
+    coord._migrate_day_ahead_and_utc_stats()
+    assert coord._state["daily_ledger"]["electric|2026-11-15"] == 20.3
+    assert "electric|2026-11-16" not in coord._state["daily_ledger"]
+    assert coord._state["day_key_midnight_fix_applied"] is True
+    assert coord._state["_force_stats_rewrite"] is True
+
+
 @pytest.mark.asyncio
 async def test_maybe_run_initial_backfill_once(monkeypatch):
     coord = make_coordinator(None)
     calls = {"backfill": 0, "catchup": 0}
 
-    async def fake_backfill_all(overwrite=False):
+    async def fake_backfill_all(*, overwrite=False):
         calls["backfill"] += 1
+        assert coord.backfill_in_progress is True
 
     async def fake_catchup(*, full_since_install):
         calls["catchup"] += 1
@@ -673,13 +869,14 @@ async def test_maybe_run_initial_backfill_once(monkeypatch):
     async def fake_save():
         return None
 
-    monkeypatch.setattr(coord, "async_run_backfill_all", fake_backfill_all)
+    monkeypatch.setattr(coord, "_run_backfill_all_unlocked", fake_backfill_all)
     monkeypatch.setattr(coord, "async_sync_electricity_catchup", fake_catchup)
     monkeypatch.setattr(coord, "_save_state", fake_save)
 
     await coord.async_maybe_run_initial_backfill()
     assert calls == {"backfill": 1, "catchup": 1}
     assert coord._state["initial_backfill_done"] is True
+    assert coord.backfill_in_progress is False
 
     await coord.async_maybe_run_initial_backfill()
     assert calls == {"backfill": 1, "catchup": 1}

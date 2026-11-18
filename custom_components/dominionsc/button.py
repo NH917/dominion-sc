@@ -9,13 +9,16 @@ from homeassistant.core import HomeAssistant
 from homeassistant.helpers.device_registry import DeviceEntryType
 from homeassistant.helpers.entity import DeviceInfo
 from homeassistant.helpers.entity_platform import AddEntitiesCallback
+from homeassistant.helpers.update_coordinator import CoordinatorEntity
 
 from .const import (
+    COORDINATOR,
     DOMAIN,
     SERVICE_REWRITE_STATISTICS,
     SERVICE_RUN_BACKFILL,
     SERVICE_SYNC_ELECTRICITY_CATCHUP,
 )
+from .coordinator import DominionSCCoordinator
 
 
 async def async_setup_entry(
@@ -24,22 +27,23 @@ async def async_setup_entry(
     async_add_entities: AddEntitiesCallback,
 ) -> None:
     """Set up Dominion SC button entities."""
+    coordinator: DominionSCCoordinator = hass.data[DOMAIN][entry.entry_id][COORDINATOR]
     async_add_entities([
-        DominionSCBackfillButton(hass, entry),
-        DominionSCElectricityCatchupButton(hass, entry),
-        DominionSCRewriteStatisticsButton(hass, entry),
+        DominionSCBackfillButton(coordinator, entry),
+        DominionSCElectricityCatchupButton(coordinator, entry),
+        DominionSCRewriteStatisticsButton(coordinator, entry),
     ])
 
 
-class DominionSCBackfillButton(ButtonEntity):
+class DominionSCBackfillButton(CoordinatorEntity[DominionSCCoordinator], ButtonEntity):
     """Button to run one backfill cycle via integration service."""
 
     _attr_has_entity_name = True
     _attr_name = "Run Backfill"
     _attr_icon = "mdi:play-circle-outline"
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        self.hass = hass
+    def __init__(self, coordinator: DominionSCCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
         self._entry_id = entry.entry_id
         self._attr_unique_id = f"{entry.entry_id}_run_backfill"
         self._attr_device_info = DeviceInfo(
@@ -50,8 +54,17 @@ class DominionSCBackfillButton(ButtonEntity):
             entry_type=DeviceEntryType.SERVICE,
         )
 
+    @property
+    def available(self) -> bool:
+        """Unavailable while any backfill is running so it cannot be pressed again."""
+        if self.coordinator.backfill_in_progress:
+            return False
+        return super().available
+
     async def async_press(self) -> None:
         """Trigger one-cycle backfill using integration service."""
+        if self.coordinator.backfill_in_progress:
+            return
         await self.hass.services.async_call(
             DOMAIN,
             SERVICE_RUN_BACKFILL,
@@ -60,15 +73,15 @@ class DominionSCBackfillButton(ButtonEntity):
         )
 
 
-class DominionSCElectricityCatchupButton(ButtonEntity):
+class DominionSCElectricityCatchupButton(CoordinatorEntity[DominionSCCoordinator], ButtonEntity):
     """Button to sync electricity from install date to now (no deep re-backfill)."""
 
     _attr_has_entity_name = True
     _attr_name = "Sync Electricity Since Install"
     _attr_icon = "mdi:flash-clock"
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        self.hass = hass
+    def __init__(self, coordinator: DominionSCCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
         self._entry_id = entry.entry_id
         self._attr_unique_id = f"{entry.entry_id}_sync_electricity_catchup"
         self._attr_device_info = DeviceInfo(
@@ -92,15 +105,15 @@ class DominionSCElectricityCatchupButton(ButtonEntity):
         )
 
 
-class DominionSCRewriteStatisticsButton(ButtonEntity):
+class DominionSCRewriteStatisticsButton(CoordinatorEntity[DominionSCCoordinator], ButtonEntity):
     """Button to trigger full historical statistics rewrite."""
 
     _attr_has_entity_name = True
     _attr_name = "Cleanup External Statistics"
     _attr_icon = "mdi:database-refresh"
 
-    def __init__(self, hass: HomeAssistant, entry: ConfigEntry) -> None:
-        self.hass = hass
+    def __init__(self, coordinator: DominionSCCoordinator, entry: ConfigEntry) -> None:
+        super().__init__(coordinator)
         self._entry_id = entry.entry_id
         self._attr_unique_id = f"{entry.entry_id}_rewrite_statistics"
         self._attr_device_info = DeviceInfo(

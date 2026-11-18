@@ -19,6 +19,9 @@ from .const import (
     CONF_BACKFILL_CYCLES_TARGET,
     CONF_DAILY_ELECTRIC_CATCHUP,
     CONF_DAILY_LOOKBACK_DAYS,
+    CONF_ENABLE_DAILY_STATISTICS,
+    CONF_ENABLE_HOURLY_STATISTICS,
+    CONF_ENABLE_MONTHLY_STATISTICS,
     CONF_PASSWORD,
     CONF_POLL_MINUTES,
     CONF_TFA_TOKEN,
@@ -27,6 +30,9 @@ from .const import (
     DEFAULT_BACKFILL_CYCLES_TARGET,
     DEFAULT_DAILY_ELECTRIC_CATCHUP,
     DEFAULT_DAILY_LOOKBACK_DAYS,
+    DEFAULT_ENABLE_DAILY_STATISTICS,
+    DEFAULT_ENABLE_HOURLY_STATISTICS,
+    DEFAULT_ENABLE_MONTHLY_STATISTICS,
     DEFAULT_POLL_MINUTES,
     DEFAULT_VERIFY_SSL,
     DOMAIN,
@@ -348,6 +354,39 @@ class DominionSCOptionsFlow(config_entries.OptionsFlow):
                         unit_of_measurement="days",
                     )
                 ),
+                vol.Optional(
+                    CONF_ENABLE_HOURLY_STATISTICS,
+                    description={
+                        "suggested_value": bool(
+                            _get_current(
+                                CONF_ENABLE_HOURLY_STATISTICS,
+                                DEFAULT_ENABLE_HOURLY_STATISTICS,
+                            )
+                        )
+                    },
+                ): BooleanSelector(),
+                vol.Optional(
+                    CONF_ENABLE_DAILY_STATISTICS,
+                    description={
+                        "suggested_value": bool(
+                            _get_current(
+                                CONF_ENABLE_DAILY_STATISTICS,
+                                DEFAULT_ENABLE_DAILY_STATISTICS,
+                            )
+                        )
+                    },
+                ): BooleanSelector(),
+                vol.Optional(
+                    CONF_ENABLE_MONTHLY_STATISTICS,
+                    description={
+                        "suggested_value": bool(
+                            _get_current(
+                                CONF_ENABLE_MONTHLY_STATISTICS,
+                                DEFAULT_ENABLE_MONTHLY_STATISTICS,
+                            )
+                        )
+                    },
+                ): BooleanSelector(),
                 vol.Optional(
                     CONF_DAILY_ELECTRIC_CATCHUP,
                     description={

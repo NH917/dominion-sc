@@ -11,6 +11,7 @@ import time
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 from urllib.parse import urljoin
+from zoneinfo import ZoneInfo
 
 import requests
 from bs4 import BeautifulSoup
@@ -19,6 +20,9 @@ import logging
 from .bidgely_client import BidgelyClient, BidgelyClientError, JsonDict
 
 _LOGGER = logging.getLogger(__name__)
+
+# Bidgely interval windows are Eastern wall-clock; keep defaults timezone-aware.
+_UTILITY_TZ = ZoneInfo("America/New_York")
 
 class DominionSCClient:
     _bidgely_client: Optional[BidgelyClient] = None
@@ -677,7 +681,7 @@ class DominionSCClient:
         locale: str = "en_US",
     ) -> JsonDict:
         """Fetch sub-daily (hourly/interval) usage via Bidgely mode=day."""
-        now = datetime.datetime.now()
+        now = datetime.datetime.now(_UTILITY_TZ)
         resolved_end = day_end if day_end is not None else now
         resolved_start = day_start if day_start is not None else resolved_end - datetime.timedelta(days=1)
         bidgely = self._ensure_bidgely_ready()

@@ -250,6 +250,7 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
         processed.append("sync_daily")
 
     async def fake_sync_hourly(force_rewrite):
+        assert force_rewrite is True
         processed.append("sync_hourly")
 
     async def fake_sync_monthly(force_rewrite):
@@ -258,8 +259,13 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
     async def fake_save_state():
         pass
 
+    async def fake_hourly_for_cycle(cycle, *, overwrite):
+        processed.append(f"hourly:{cycle.key}")
+        return 1
+
     monkeypatch.setattr(coord, "_ensure_authenticated", fake_ensure_authenticated)
     monkeypatch.setattr(coord, "_process_backfill", fake_process_backfill)
+    monkeypatch.setattr(coord, "_backfill_hourly_for_cycle", fake_hourly_for_cycle)
     monkeypatch.setattr(coord, "_sync_external_statistics", fake_sync_external_statistics)
     monkeypatch.setattr(coord, "_sync_hourly_external_statistics", fake_sync_hourly)
     monkeypatch.setattr(coord, "_sync_monthly_external_statistics", fake_sync_monthly)
@@ -270,6 +276,9 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
     assert processed == [
         "2026-01-01|2026-01-02",
         "2026-02-01|2026-02-02",
+        # fake_process_backfill skips hourly, so both cycles are swept newest-first
+        "hourly:2026-02-01|2026-02-02",
+        "hourly:2026-01-01|2026-01-02",
         "sync_daily",
         "sync_hourly",
         "sync_monthly",
@@ -925,3 +934,132 @@ async def test_maybe_run_initial_backfill_once(monkeypatch):
 
     await coord.async_maybe_run_initial_backfill()
     assert calls == {"backfill": 1, "catchup": 1}
+
+
+class _ExecutorHass:
+    async def async_add_executor_job(self, func, *a, **kw):
+        return func()
+
+
+def _hourly_rows(day: datetime.date, kwh: float = 0.5) -> list[dict]:
+    rows = []
+    for hour in range(24):
+        end = datetime.datetime.combine(day, datetime.time.min) + datetime.timedelta(hours=hour + 1)
+        rows.append(
+            {"intervalEndDate": end.strftime("%Y-%m-%d %H:%M:%S"), "consumption": kwh, "cost": 0.05}
+        )
+    return rows
+
+
+@pytest.mark.asyncio
+async def test_manual_backfill_fills_hourly_when_daily_cycles_already_complete(monkeypatch):
+    """Cycles completed before hourly backfill existed must still get intervals."""
+    coord = make_coordinator(None)
+    coord._state["backfill"]["missing_cycles"] = []
+    coord._state["backfill"]["completed_cycles"] = [
+        "2026-09-01|2026-09-30",
+        "2026-10-01|2026-10-31",
+    ]
+    seen: list[str] = []
+
+    async def fake_store(start, end, *, electric_only, overwrite=False):
+        seen.append(start.date().isoformat())
+        coord._state["interval_ledger"][f"electric|{start.date()} 01:00:00"] = 1.0
+        return 1
+
+    monkeypatch.setattr(coord, "_store_interval_window", fake_store)
+
+    await coord._process_backfill(overwrite=False, allow_initialize_missing=False)
+    assert seen == ["2026-10-01"]
+    assert coord._state["backfill"]["hourly_completed_cycles"] == ["2026-10-01|2026-10-31"]
+
+    await coord._process_backfill(overwrite=False, allow_initialize_missing=False)
+    assert seen == ["2026-10-01", "2026-09-01"]
+    assert coord._pending_hourly_cycles() == []
+
+
+@pytest.mark.asyncio
+async def test_process_backfill_runs_hourly_even_when_daily_empty(monkeypatch):
+    coord = make_coordinator(None)
+    cycle_key = "2026-10-01|2026-10-31"
+    coord._state["backfill"]["missing_cycles"] = [cycle_key]
+    calls = {"hourly": 0}
+
+    async def empty_daily(start, end):
+        return []
+
+    async def fake_hourly_monthly(cycle, *, overwrite):
+        calls["hourly"] += 1
+
+    monkeypatch.setattr(coord, "_fetch_daily_rows", empty_daily)
+    monkeypatch.setattr(coord, "_backfill_hourly_and_monthly_for_cycle", fake_hourly_monthly)
+
+    await coord._process_backfill(overwrite=False, allow_initialize_missing=False)
+    assert calls["hourly"] == 1
+    assert cycle_key in coord._state["backfill"]["missing_cycles"]
+
+
+@pytest.mark.asyncio
+async def test_backfill_hourly_marks_complete_after_repeated_empty(monkeypatch):
+    coord = make_coordinator(None)
+    cycle = sc_coordinator.BillingCycle(
+        start=datetime.date(2025, 1, 1), end=datetime.date(2025, 1, 31)
+    )
+
+    async def empty_store(start, end, *, electric_only, overwrite=False):
+        return 0
+
+    monkeypatch.setattr(coord, "_store_interval_window", empty_store)
+    for _ in range(sc_coordinator._HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS - 1):
+        await coord._backfill_hourly_for_cycle(cycle, overwrite=False)
+        assert cycle.key not in coord._state["backfill"]["hourly_completed_cycles"]
+    await coord._backfill_hourly_for_cycle(cycle, overwrite=False)
+    assert cycle.key in coord._state["backfill"]["hourly_completed_cycles"]
+
+
+@pytest.mark.asyncio
+async def test_fetch_interval_payload_uses_portal_start_zero_and_filters_range(monkeypatch):
+    covered = datetime.date(2026, 10, 2)
+    outside = datetime.date(2026, 11, 5)
+    calls: list[tuple] = []
+
+    class Client:
+        def get_hourly_usage(self, measurement_type, day_start, day_end, locale, skip_ongoing_cycle=True):
+            calls.append((day_start, day_end))
+            if day_start == 0:
+                return {"payload": {"usageChartDataList": _hourly_rows(covered) + _hourly_rows(outside)}}
+            return {"payload": {"usageChartDataList": _hourly_rows(day_start.date(), kwh=0.25)}}
+
+    monkeypatch.setattr(sc_coordinator, "DominionSCClient", lambda verify_ssl=True: Client())
+    coord = make_coordinator(None)
+    coord.hass = _ExecutorHass()
+    tz = coord._local_tz()
+    start = datetime.datetime(2026, 10, 1, tzinfo=tz)
+    end = datetime.datetime.combine(datetime.date(2026, 10, 3), datetime.time.max, tzinfo=tz)
+
+    payload = await coord._fetch_interval_payload("ELECTRIC", start, end)
+
+    assert calls[0][0] == 0
+    assert calls[0][1] == end
+    per_day_starts = [c[0].date() for c in calls[1:]]
+    # 10-02 was fully covered by start=0; only 10-01 and 10-03 fetched per day.
+    assert per_day_starts == [datetime.date(2026, 10, 1), datetime.date(2026, 10, 3)]
+    rows = payload["payload"]["usageChartDataList"]
+    assert not any(r["intervalEndDate"].startswith("2026-11-05") for r in rows)
+    days = {coord._interval_row_day_key(r) for r in rows}
+    assert days == {"2026-10-01", "2026-10-02", "2026-10-03"}
+
+
+def test_parse_usage_rows_accepts_alternate_usage_keys():
+    rows = sc_coordinator.DominionSCCoordinator._parse_usage_rows(
+        {
+            "payload": {
+                "usageChartDataList": [
+                    {"intervalEndDate": "2026-10-01 01:00:00", "usage": 1.2, "cost": 0.1},
+                    {"intervalEndDate": "2026-10-01 02:00:00", "consumption": None, "value": "0.8"},
+                ]
+            }
+        },
+        fuel="electric",
+    )
+    assert [r["electric_usage_kwh"] for r in rows] == [1.2, 0.8]

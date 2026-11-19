@@ -741,16 +741,21 @@ def test_ensure_installed_at_and_upgrade_skips_initial_backfill():
 
 
 @pytest.mark.asyncio
-async def test_electricity_catchup_full_since_install(monkeypatch):
+async def test_sync_current_cycle(monkeypatch):
     coord = make_coordinator(None)
     coord._state["installed_at"] = "2026-03-01T12:00:00-05:00"
     coord._state["initial_backfill_done"] = True
+    coord._state["bill_projection"] = {
+        "billStartDateFormatted": "2026-03-01",
+        "billEndDateFormatted": "2026-03-31",
+    }
+    seen = {"daily": None, "intervals": None}
 
     async def fake_auth():
         return None
 
     async def fake_daily(start, end):
-        assert start == datetime.date(2026, 3, 1)
+        seen["daily"] = (start, end)
         return [
             {
                 "date": "2026-03-01",
@@ -760,6 +765,66 @@ async def test_electricity_catchup_full_since_install(monkeypatch):
                 "gas_cost": 0.0,
             }
         ]
+
+    async def fake_store(start, end, *, electric_only, overwrite=False):
+        seen["intervals"] = (start.date(), end.date(), electric_only, overwrite)
+        return None
+
+    async def fake_monthly():
+        return None
+
+    async def fake_sync(force_rewrite=False):
+        return None
+
+    async def fake_save():
+        return None
+
+    monkeypatch.setattr(coord, "_ensure_authenticated", fake_auth)
+    monkeypatch.setattr(coord, "_catchup_electric_daily", fake_daily)
+    monkeypatch.setattr(coord, "_store_interval_window", fake_store)
+    monkeypatch.setattr(coord, "_monthly_reconcile", fake_monthly)
+    monkeypatch.setattr(coord, "_sync_external_statistics", fake_sync)
+    monkeypatch.setattr(coord, "_sync_hourly_external_statistics", fake_sync)
+    monkeypatch.setattr(coord, "_sync_monthly_external_statistics", fake_sync)
+    monkeypatch.setattr(coord, "_save_state", fake_save)
+
+    class FixedDateTime(datetime.datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 3, 10, 15, 0, 0, tzinfo=datetime.timezone.utc)
+
+    monkeypatch.setattr(sc_coordinator, "datetime", FixedDateTime)
+
+    await coord.async_sync_current_cycle()
+    assert seen["daily"] == (datetime.date(2026, 3, 1), datetime.date(2026, 3, 10))
+    assert seen["intervals"] == (
+        datetime.date(2026, 3, 1),
+        datetime.date(2026, 3, 10),
+        True,
+        True,
+    )
+    assert coord._state["electric_catchup"]["watermark_date"] == "2026-03-10"
+    assert coord._state["electric_catchup"]["last_run"]
+
+
+@pytest.mark.asyncio
+async def test_electricity_catchup_watermark(monkeypatch):
+    coord = make_coordinator(None)
+    coord._state["installed_at"] = "2026-03-01T12:00:00-05:00"
+    coord._state["initial_backfill_done"] = True
+    coord._state["electric_catchup"] = {
+        "last_run": "2026-03-09T01:00:00+00:00",
+        "watermark_date": "2026-03-09",
+    }
+
+    async def fake_auth():
+        return None
+
+    async def fake_daily(start, end):
+        # Default lookback is 3 days from watermark when not full_since_install
+        assert start <= datetime.date(2026, 3, 9)
+        assert end == datetime.date(2026, 3, 10)
+        return []
 
     async def fake_intervals(start, end):
         return None
@@ -782,7 +847,6 @@ async def test_electricity_catchup_full_since_install(monkeypatch):
     monkeypatch.setattr(coord, "_sync_monthly_external_statistics", fake_sync)
     monkeypatch.setattr(coord, "_save_state", fake_save)
 
-    # Freeze "today" used by catch-up
     class FixedDateTime(datetime.datetime):
         @classmethod
         def now(cls, tz=None):
@@ -790,9 +854,8 @@ async def test_electricity_catchup_full_since_install(monkeypatch):
 
     monkeypatch.setattr(sc_coordinator, "datetime", FixedDateTime)
 
-    await coord.async_sync_electricity_catchup(full_since_install=True)
+    await coord.async_sync_electricity_catchup(full_since_install=False)
     assert coord._state["electric_catchup"]["watermark_date"] == "2026-03-10"
-    assert coord._state["electric_catchup"]["last_run"]
 
 
 @pytest.mark.asyncio
@@ -911,29 +974,29 @@ def test_migrate_day_ahead_shifts_ledger_back_one_day():
 @pytest.mark.asyncio
 async def test_maybe_run_initial_backfill_once(monkeypatch):
     coord = make_coordinator(None)
-    calls = {"backfill": 0, "catchup": 0}
+    calls = {"backfill": 0, "sync_cycle": 0}
 
     async def fake_backfill_all(*, overwrite=False):
         calls["backfill"] += 1
         assert coord.backfill_in_progress is True
 
-    async def fake_catchup(*, full_since_install):
-        calls["catchup"] += 1
+    async def fake_sync_cycle():
+        calls["sync_cycle"] += 1
 
     async def fake_save():
         return None
 
     monkeypatch.setattr(coord, "_run_backfill_all_unlocked", fake_backfill_all)
-    monkeypatch.setattr(coord, "async_sync_electricity_catchup", fake_catchup)
+    monkeypatch.setattr(coord, "async_sync_current_cycle", fake_sync_cycle)
     monkeypatch.setattr(coord, "_save_state", fake_save)
 
     await coord.async_maybe_run_initial_backfill()
-    assert calls == {"backfill": 1, "catchup": 1}
+    assert calls == {"backfill": 1, "sync_cycle": 1}
     assert coord._state["initial_backfill_done"] is True
     assert coord.backfill_in_progress is False
 
     await coord.async_maybe_run_initial_backfill()
-    assert calls == {"backfill": 1, "catchup": 1}
+    assert calls == {"backfill": 1, "sync_cycle": 1}
 
 
 class _ExecutorHass:
@@ -1060,6 +1123,196 @@ async def test_backfill_hourly_empty_keeps_pending_and_remaining(monkeypatch):
     assert cycle.key not in coord._state["backfill"].get("hourly_completed_cycles", [])
     assert any(c.key == cycle.key for c in coord._pending_hourly_cycles())
     assert coord.backfill_remaining_count >= 1
+
+
+@pytest.mark.asyncio
+async def test_backfill_hourly_positive_count_without_ledger_rows_stays_pending(monkeypatch):
+    coord = make_coordinator(None)
+    cycle = sc_coordinator.BillingCycle(
+        start=datetime.date(2026, 10, 1), end=datetime.date(2026, 10, 31)
+    )
+    coord._state["backfill"]["completed_cycles"] = [cycle.key]
+
+    async def store_outside_cycle(start, end, *, electric_only, overwrite=False):
+        coord._state["interval_ledger"]["electric|2026-11-01 01:00:00"] = 1.0
+        return 24
+
+    monkeypatch.setattr(coord, "_store_interval_window", store_outside_cycle)
+    await coord._backfill_hourly_for_cycle(cycle, overwrite=False)
+
+    assert cycle.key not in coord._state["backfill"]["hourly_completed_cycles"]
+    assert [c.key for c in coord._pending_hourly_cycles()] == [cycle.key]
+
+
+def test_midnight_interval_key_counts_for_previous_day_cycle():
+    coord = make_coordinator(None)
+    oct_cycle = sc_coordinator.BillingCycle(
+        start=datetime.date(2026, 10, 1), end=datetime.date(2026, 10, 31)
+    )
+    nov_cycle = sc_coordinator.BillingCycle(
+        start=datetime.date(2026, 11, 1), end=datetime.date(2026, 11, 30)
+    )
+    coord._state["interval_ledger"]["electric|2026-11-01 00:00:00"] = 1.0
+    coord._state["interval_ledger"]["gas|2026-11-15 12:00:00"] = 50.0
+    assert coord._cycle_has_hourly_data(oct_cycle) is True
+    assert coord._cycle_has_hourly_data(nov_cycle) is False
+
+
+@pytest.mark.asyncio
+async def test_backfill_hourly_fetch_error_does_not_count_as_empty_attempt(monkeypatch):
+    coord = make_coordinator(None)
+    cycle = sc_coordinator.BillingCycle(
+        start=datetime.date(2026, 10, 1), end=datetime.date(2026, 10, 31)
+    )
+
+    async def failing_store(start, end, *, electric_only, overwrite=False):
+        raise RuntimeError("auth expired")
+
+    monkeypatch.setattr(coord, "_store_interval_window", failing_store)
+    await coord._backfill_hourly_for_cycle(cycle, overwrite=False)
+    assert cycle.key not in coord._state["backfill"].get("hourly_empty_attempts", {})
+
+
+@pytest.mark.asyncio
+async def test_exhausted_hourly_cycle_does_not_block_other_pending_cycles(monkeypatch):
+    """Run Backfill must move past an unfillable newest cycle to fill the others."""
+    coord = make_coordinator(None)
+    sep = "2026-09-01|2026-09-30"
+    octo = "2026-10-01|2026-10-31"
+    coord._state["backfill"]["missing_cycles"] = []
+    coord._state["backfill"]["completed_cycles"] = [sep, octo]
+    seen: list[str] = []
+
+    async def store(start, end, *, electric_only, overwrite=False):
+        seen.append(start.date().isoformat())
+        if start.month == 9:
+            coord._state["interval_ledger"]["electric|2026-09-10 05:00:00"] = 1.0
+            return 1
+        return 0
+
+    monkeypatch.setattr(coord, "_store_interval_window", store)
+    await coord._process_backfill(overwrite=False, allow_initialize_missing=False)
+    await coord._process_backfill(overwrite=False, allow_initialize_missing=False)
+
+    assert seen == ["2026-10-01", "2026-09-01"]
+    assert [c.key for c in coord._pending_hourly_cycles()] == [octo]
+
+
+@pytest.mark.asyncio
+async def test_scheduled_backfill_skips_exhausted_but_summary_reports_it(monkeypatch):
+    coord = make_coordinator(None)
+    cycle_key = "2026-10-01|2026-10-31"
+    coord._state["backfill"]["completed_cycles"] = [cycle_key]
+    coord._state["backfill"]["hourly_empty_attempts"] = {
+        cycle_key: sc_coordinator._HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS
+    }
+    monkeypatch.setattr(coord, "_initialize_backfill_cycles", lambda: None)
+    calls: list[str] = []
+
+    async def store(start, end, *, electric_only, overwrite=False):
+        calls.append(start.date().isoformat())
+        return 0
+
+    monkeypatch.setattr(coord, "_store_interval_window", store)
+    await coord._process_backfill(overwrite=False, retry_exhausted_hourly=False)
+    assert calls == []
+
+    summary = coord.backfill_summary
+    assert cycle_key in summary["remaining_cycles"]
+    assert summary["hourly_exhausted_cycles"] == [cycle_key]
+
+    await coord._process_backfill(overwrite=False, allow_initialize_missing=False)
+    assert calls == ["2026-10-01"]
+
+
+@pytest.mark.asyncio
+async def test_store_interval_window_keeps_electric_when_gas_fetch_fails(monkeypatch):
+    coord = make_coordinator(None)
+    coord._state["interval_ledger"]["gas|2026-10-01 01:00:00"] = 30.0
+
+    async def fake_fetch(measurement_type, start, end):
+        if measurement_type == "GAS":
+            raise RuntimeError("no gas service")
+        return {"payload": {"usageChartDataList": _hourly_rows(datetime.date(2026, 10, 1))}}
+
+    monkeypatch.setattr(coord, "_fetch_interval_payload", fake_fetch)
+    tz = coord._local_tz()
+    positive = await coord._store_interval_window(
+        datetime.datetime(2026, 10, 1, tzinfo=tz),
+        datetime.datetime(2026, 10, 1, 23, 59, tzinfo=tz),
+        electric_only=False,
+        overwrite=True,
+    )
+    assert positive == 24
+    assert coord._state["interval_ledger"]["electric|2026-10-01 01:00:00"] == 0.5
+    assert coord._state["interval_ledger"]["gas|2026-10-01 01:00:00"] == 30.0
+
+
+@pytest.mark.asyncio
+async def test_fetch_interval_payload_survives_single_day_failure(monkeypatch):
+    class Client:
+        def get_hourly_usage(self, measurement_type, day_start, day_end, locale, skip_ongoing_cycle=True):
+            if day_start == 0:
+                return {"payload": {"usageChartDataList": []}}
+            if day_start.day == 2:
+                raise RuntimeError("timeout")
+            return {"payload": {"usageChartDataList": _hourly_rows(day_start.date())}}
+
+    monkeypatch.setattr(sc_coordinator, "DominionSCClient", lambda verify_ssl=True: Client())
+    coord = make_coordinator(None)
+    coord.hass = _ExecutorHass()
+    tz = coord._local_tz()
+    payload = await coord._fetch_interval_payload(
+        "ELECTRIC",
+        datetime.datetime(2026, 10, 1, tzinfo=tz),
+        datetime.datetime.combine(datetime.date(2026, 10, 3), datetime.time.max, tzinfo=tz),
+    )
+    days = {coord._interval_row_day_key(r) for r in payload["payload"]["usageChartDataList"]}
+    assert days == {"2026-10-01", "2026-10-03"}
+
+
+@pytest.mark.asyncio
+async def test_fetch_interval_payload_raises_when_every_request_fails(monkeypatch):
+    class Client:
+        def get_hourly_usage(self, *a, **kw):
+            raise RuntimeError("down")
+
+    monkeypatch.setattr(sc_coordinator, "DominionSCClient", lambda verify_ssl=True: Client())
+    coord = make_coordinator(None)
+    coord.hass = _ExecutorHass()
+    tz = coord._local_tz()
+    with pytest.raises(RuntimeError):
+        await coord._fetch_interval_payload(
+            "ELECTRIC",
+            datetime.datetime(2026, 10, 1, tzinfo=tz),
+            datetime.datetime(2026, 10, 1, 23, 59, tzinfo=tz),
+        )
+
+
+@pytest.mark.asyncio
+async def test_manual_backfill_requeues_stale_missing_cycles(monkeypatch):
+    """Button must work the eligible−completed queue even if missing_cycles is stale."""
+    coord = make_coordinator(None)
+    coord._state["backfill"]["missing_cycles"] = []
+    seen: dict[str, object] = {}
+
+    async def noop(*a, **kw):
+        return None
+
+    async def fake_process(overwrite, cycle_key=None, allow_initialize_missing=False):
+        seen["missing"] = list(coord._state["backfill"]["missing_cycles"])
+
+    monkeypatch.setattr(coord, "_ensure_authenticated", noop)
+    monkeypatch.setattr(coord, "_process_backfill", fake_process)
+    monkeypatch.setattr(coord, "_sync_external_statistics", noop)
+    monkeypatch.setattr(coord, "_sync_hourly_external_statistics", noop)
+    monkeypatch.setattr(coord, "_sync_monthly_external_statistics", noop)
+    monkeypatch.setattr(coord, "_save_state", noop)
+    monkeypatch.setattr(coord, "_publish_coordinator_data", lambda: None)
+
+    await coord.async_run_backfill(overwrite=False)
+    assert seen["missing"] == coord.backfill_summary["incomplete_cycles"]
+    assert seen["missing"]
 
 
 @pytest.mark.asyncio

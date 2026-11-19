@@ -225,9 +225,10 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         - completed_in_scope: completed daily cycles in the current eligible set
         - incomplete_cycles: eligible daily cycles not yet completed
         - pending_hourly_cycles: daily-complete cycles still missing hourly intervals
+        - hourly_exhausted_cycles: pending hourly cycles that hit the empty-attempt cap
+          (still counted in remaining; scheduled polls stop retrying them)
         - remaining_cycles: daily incomplete + pending hourly (what the Remaining sensor shows)
         """
-        self._reconcile_hourly_completion_flags()
         target = self.backfill_cycles_target
         eligible = self._build_recent_monthly_cycles(
             now_date=self._utility_today(), target=target
@@ -252,6 +253,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             "completed_in_scope": completed_in_scope,
             "incomplete_cycles": incomplete,
             "pending_hourly_cycles": pending_hourly,
+            "hourly_exhausted_cycles": [k for k in pending_hourly if self._hourly_exhausted(k)],
             "remaining_cycles": remaining,
         }
 
@@ -375,9 +377,11 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             cycle_key,
         )
         await self._ensure_authenticated()
-        # When triggered manually via the service/button, callers may choose
-        # whether to allow repopulating missing cycles. Pass the flag through
-        # to the processing routine.
+        # missing_cycles can lag the Remaining sensor (target raised, month
+        # rolled over since the last poll). Re-derive eligible − completed so
+        # the button works the same queue the sensor counts.
+        if not cycle_key and not self._state["backfill"].get("missing_cycles"):
+            self._initialize_backfill_cycles()
         await self._process_backfill(
             overwrite=overwrite, cycle_key=cycle_key, allow_initialize_missing=allow_initialize_missing
         )
@@ -454,8 +458,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
     async def async_maybe_run_initial_backfill(self) -> None:
         """On first integration, drain the historical month-cycle backfill queue once.
 
-        Subsequent catch-up (button / daily) only fills from install → now and
-        does not re-queue completed historical cycles.
+        Subsequent catch-up (button / daily) syncs the open billing cycle or
+        watermark window and does not re-queue completed historical cycles.
         """
         self._ensure_installed_at()
         if self._state.get("initial_backfill_done"):
@@ -473,8 +477,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         )
         try:
             await self._run_backfill_all_unlocked(overwrite=False)
-            # Also pull electricity from install → now so current cycle is filled.
-            await self.async_sync_electricity_catchup(full_since_install=True)
+            # Fill the open billing cycle (daily + hourly) after historical months.
+            await self.async_sync_current_cycle()
             self._state["initial_backfill_done"] = True
             await self._save_state()
             _LOGGER.info(
@@ -491,13 +495,64 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         finally:
             self._end_backfill()
 
-    async def async_sync_electricity_catchup(self, *, full_since_install: bool = True) -> None:
-        """Fill electricity (and cost) from install/watermark → now without deep re-backfill.
+    async def async_sync_current_cycle(self) -> None:
+        """Fill electricity usage/cost for the open billing cycle (daily + hourly).
 
-        ``full_since_install=True`` (button): daily rows from installed_at → today,
-        plus a capped hourly window.
-        ``full_since_install=False`` (daily schedule): only from catch-up watermark
-        minus lookback → today.
+        Uses ``current_billing_cycle`` (bill projection / current usage), clamped
+        to today so a future bill-end date does not request unfinished days.
+        """
+        await self._ensure_authenticated()
+        self._ensure_installed_at()
+
+        today = self._utility_today()
+        cycle = self.current_billing_cycle
+        start = cycle.start
+        end = min(cycle.end, today)
+        if start > end:
+            start = end
+
+        _LOGGER.info(
+            "Sync current cycle: entry=%s start=%s end=%s",
+            self.config_entry.entry_id,
+            start.isoformat(),
+            end.isoformat(),
+        )
+
+        await self._catchup_electric_daily(start, end)
+        utility_tz = self._local_tz()
+        start_dt = datetime.combine(start, time.min, tzinfo=utility_tz)
+        end_dt = datetime.combine(end, time.max, tzinfo=utility_tz)
+        await self._store_interval_window(
+            start_dt, end_dt, electric_only=True, overwrite=True
+        )
+        await self._monthly_reconcile()
+        await self._sync_external_statistics(force_rewrite=False)
+        await self._sync_hourly_external_statistics(force_rewrite=True)
+        await self._sync_monthly_external_statistics(force_rewrite=False)
+        self._apply_monotonic_guard()
+
+        catchup = self._state.setdefault(
+            "electric_catchup",
+            {"last_run": None, "watermark_date": None},
+        )
+        catchup["last_run"] = self._utility_now().isoformat()
+        catchup["watermark_date"] = today.isoformat()
+        self._set_last_sync()
+        await self._save_state()
+        self.async_set_updated_data(dict(self.totals))
+        _LOGGER.debug(
+            "Sync current cycle finished: entry=%s watermark=%s",
+            self.config_entry.entry_id,
+            catchup["watermark_date"],
+        )
+
+    async def async_sync_electricity_catchup(self, *, full_since_install: bool = False) -> None:
+        """Incremental electricity catch-up used by the daily schedule.
+
+        ``full_since_install=True``: daily rows from installed_at → today, plus a
+        capped hourly window.
+        ``full_since_install=False`` (default): from catch-up watermark minus
+        lookback → today.
         """
         await self._ensure_authenticated()
         self._ensure_installed_at()
@@ -583,7 +638,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
         # Compute eligible cycles for the new target
         all_eligible = self._build_recent_monthly_cycles(
-            now_date=datetime.now().date(), target=new_target
+            now_date=self._utility_today(), target=new_target
         )
         all_eligible_keys = [c.key for c in all_eligible]
 
@@ -638,7 +693,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             # Hold the busy lock so the Run Backfill button stays unavailable.
             if self._try_begin_backfill("scheduled one-cycle backfill"):
                 try:
-                    await self._process_backfill(overwrite=False)
+                    await self._process_backfill(overwrite=False, retry_exhausted_hourly=False)
                 finally:
                     self._end_backfill()
             # else: a manual/initial backfill is already running; skip this poll's cycle
@@ -1698,6 +1753,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         and keep only rows inside the requested calendar range. Multi-day
         windows often return empty for Dominion SC, so any day not covered by
         the portal-shaped response is then fetched one calendar day at a time.
+
+        A failed request only loses its own rows; the error is re-raised only
+        when every request failed, so one bad day cannot discard a whole month.
         """
         utility_tz = self._local_tz()
         start_local = start.astimezone(utility_tz) if start.tzinfo else start.replace(tzinfo=utility_tz)
@@ -1705,16 +1763,27 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         first = start_local.date()
         last = end_local.date()
         today = self._utility_today()
+        requests = 0
+        last_error: Exception | None = None
 
-        portal_payload = await self.hass.async_add_executor_job(
-            lambda: self._client.get_hourly_usage(
-                measurement_type=measurement_type,
-                day_start=0,
-                day_end=end_local,
-                locale="en_US",
-                skip_ongoing_cycle=last < today,
+        requests += 1
+        try:
+            portal_payload = await self.hass.async_add_executor_job(
+                lambda: self._client.get_hourly_usage(
+                    measurement_type=measurement_type,
+                    day_start=0,
+                    day_end=end_local,
+                    locale="en_US",
+                    skip_ongoing_cycle=last < today,
+                )
             )
-        )
+        except Exception as err:  # pylint: disable=broad-except
+            last_error = err
+            portal_payload = None
+            _LOGGER.warning(
+                "mode=day %s start=0 end=%s failed: %s", measurement_type, end_local.isoformat(), err
+            )
+        failures = 1 if last_error is not None else 0
         merged = self._interval_rows_in_date_range(portal_payload, first, last)
         rows_per_day: dict[str, int] = {}
         for row in merged:
@@ -1741,15 +1810,25 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             day_end = datetime.combine(day, time(23, 59, 59), tzinfo=utility_tz)
             # Today is the ongoing cycle — include completed hours so far.
             skip_ongoing = day < today
-            payload = await self.hass.async_add_executor_job(
-                lambda d0=day_start, d1=day_end, skip=skip_ongoing: self._client.get_hourly_usage(
-                    measurement_type=measurement_type,
-                    day_start=d0,
-                    day_end=d1,
-                    locale="en_US",
-                    skip_ongoing_cycle=skip,
+            requests += 1
+            try:
+                payload = await self.hass.async_add_executor_job(
+                    lambda d0=day_start, d1=day_end, skip=skip_ongoing: self._client.get_hourly_usage(
+                        measurement_type=measurement_type,
+                        day_start=d0,
+                        day_end=d1,
+                        locale="en_US",
+                        skip_ongoing_cycle=skip,
+                    )
                 )
-            )
+            except Exception as err:  # pylint: disable=broad-except
+                failures += 1
+                last_error = err
+                _LOGGER.warning(
+                    "mode=day %s day=%s failed: %s", measurement_type, day.isoformat(), err
+                )
+                day += timedelta(days=1)
+                continue
             rows = self._interval_rows_in_date_range(payload, first, last)
             _LOGGER.debug(
                 "mode=day %s day=%s rows=%s",
@@ -1768,6 +1847,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             len(merged),
             len(covered_days),
         )
+        if last_error is not None and failures == requests:
+            raise last_error
 
         # Dedupe by interval end so overlapping day windows cannot inflate usage.
         deduped: dict[str, dict[str, Any]] = {}
@@ -1800,7 +1881,19 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 gas_rows=[],
             )
         else:
-            gas_payload = await self._fetch_interval_payload("GAS", start, end)
+            # Electric-only accounts (or a gas outage) must not discard electric rows.
+            try:
+                gas_payload = await self._fetch_interval_payload("GAS", start, end)
+            except Exception as err:  # pylint: disable=broad-except
+                _LOGGER.warning(
+                    "Gas interval fetch failed for %s..%s; storing electric only: %s",
+                    start.isoformat(),
+                    end.isoformat(),
+                    err,
+                )
+                gas_payload = {}
+                # Skip the gas ledger writes so overwrite cannot pop stored gas keys.
+                electric_only = True
             rows = self._merge_usage_rows(
                 electric_rows=self._parse_usage_rows(electric_payload, fuel="electric"),
                 gas_rows=self._parse_usage_rows(gas_payload, fuel="gas"),
@@ -2247,7 +2340,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         backfill = self._state["backfill"]
         hourly_completed = backfill.setdefault("hourly_completed_cycles", [])
         attempts = backfill.setdefault("hourly_empty_attempts", {})
-        if positive > 0 or self._cycle_has_hourly_data(cycle):
+        if self._cycle_has_hourly_data(cycle):
             attempts.pop(cycle.key, None)
             if cycle.key not in hourly_completed:
                 hourly_completed.append(cycle.key)
@@ -2258,24 +2351,46 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             )
             return positive
 
-        attempt_n = int(attempts.get(cycle.key, 0)) + 1
-        attempts[cycle.key] = attempt_n
-        # Never mark hourly-complete on empty fetches — remaining must stay > 0
-        # until interval data is actually in the ledger. Drop any stale flag.
         if cycle.key in hourly_completed:
             hourly_completed.remove(cycle.key)
+        if failed:
+            return 0
+        attempt_n = int(attempts.get(cycle.key, 0)) + 1
+        attempts[cycle.key] = attempt_n
         _LOGGER.warning(
-            "Backfill hourly cycle %s returned no electric intervals (attempt %s); "
-            "leaving pending so Remaining stays accurate",
+            "Backfill hourly cycle %s returned no electric intervals (attempt %s/%s)%s",
             cycle.key,
             attempt_n,
+            _HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS,
+            "; exhausted, still pending (manual Run Backfill keeps retrying)"
+            if attempt_n >= _HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS
+            else "",
         )
         return 0
 
-    def _cycle_has_hourly_data(self, cycle: BillingCycle) -> bool:
-        """True when interval_ledger has any positive electric row in the cycle."""
-        ledger = self._state.get("interval_ledger", {}) or {}
-        for key, value in ledger.items():
+    @classmethod
+    def _interval_ledger_day(cls, interval_end: str) -> date | None:
+        """Portal day for an interval_ledger ``YYYY-MM-DD HH:MM:SS`` key suffix.
+
+        A midnight end closes the previous day (same rule as
+        ``_day_key_from_bidgely_interval``).
+        """
+        try:
+            day = date.fromisoformat(interval_end[:10])
+        except ValueError:
+            day_key = cls._day_key_from_bidgely_interval(interval_end=interval_end)
+            try:
+                return date.fromisoformat(day_key) if day_key else None
+            except ValueError:
+                return None
+        if interval_end[11:19] in ("00:00:00", "00:00"):
+            return day - timedelta(days=1)
+        return day
+
+    def _electric_interval_days(self) -> set[date]:
+        """Days with at least one positive electric interval in interval_ledger."""
+        days: set[date] = set()
+        for key, value in (self._state.get("interval_ledger", {}) or {}).items():
             if not isinstance(key, str) or not key.startswith("electric|"):
                 continue
             try:
@@ -2283,40 +2398,41 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                     continue
             except (TypeError, ValueError):
                 continue
-            interval_end = key.split("|", 1)[1]
-            parsed = self._parse_interval_end_datetime(interval_end)
-            if parsed is None:
-                continue
-            day = parsed.date()
-            if (
-                parsed.hour == 0
-                and parsed.minute == 0
-                and parsed.second == 0
-                and parsed.microsecond == 0
-            ):
-                day = day - timedelta(days=1)
-            if cycle.start <= day <= cycle.end:
-                return True
-        return False
+            day = self._interval_ledger_day(key.split("|", 1)[1])
+            if day is not None:
+                days.add(day)
+        return days
 
-    def _reconcile_hourly_completion_flags(self) -> None:
+    def _cycle_has_hourly_data(
+        self, cycle: BillingCycle, days: set[date] | None = None
+    ) -> bool:
+        """True when interval_ledger has any positive electric row in the cycle."""
+        if days is None:
+            days = self._electric_interval_days()
+        return any(cycle.start <= day <= cycle.end for day in days)
+
+    @staticmethod
+    def _cycle_from_key(key: str) -> BillingCycle | None:
+        try:
+            start_s, end_s = key.split("|")
+            return BillingCycle(start=date.fromisoformat(start_s), end=date.fromisoformat(end_s))
+        except ValueError:
+            return None
+
+    def _reconcile_hourly_completion_flags(self, days: set[date] | None = None) -> None:
         """Drop hourly_completed flags that have no interval ledger coverage."""
         backfill = self._state.setdefault("backfill", {})
-        completed = backfill.get("completed_cycles", []) or []
         hourly_completed = list(backfill.get("hourly_completed_cycles", []) or [])
         if not hourly_completed:
             return
-        kept: list[str] = []
-        for key in hourly_completed:
-            try:
-                start_s, end_s = key.split("|")
-                cycle = BillingCycle(
-                    start=date.fromisoformat(start_s), end=date.fromisoformat(end_s)
-                )
-            except ValueError:
-                continue
-            if self._cycle_has_hourly_data(cycle):
-                kept.append(key)
+        if days is None:
+            days = self._electric_interval_days()
+        kept = [
+            key
+            for key in hourly_completed
+            if (cycle := self._cycle_from_key(key)) is not None
+            and self._cycle_has_hourly_data(cycle, days)
+        ]
         if kept != hourly_completed:
             backfill["hourly_completed_cycles"] = kept
             _LOGGER.info(
@@ -2324,37 +2440,46 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 len(hourly_completed),
                 len(kept),
             )
-        # Also ensure daily-complete cycles without coverage are not stuck "done".
-        _ = completed
 
-    def _pending_hourly_cycles(self) -> list[BillingCycle]:
+    def _hourly_exhausted(self, cycle_key: str) -> bool:
+        attempts = (self._state.get("backfill", {}) or {}).get("hourly_empty_attempts") or {}
+        return int(attempts.get(cycle_key, 0)) >= _HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS
+
+    def _pending_hourly_cycles(self, *, include_exhausted: bool = True) -> list[BillingCycle]:
         """Daily-complete cycles that still lack hourly interval ledger data.
 
         Uses the interval ledger as source of truth (not only a sticky flag), so
         Remaining stays > 0 until hours are actually stored. Newest first.
+        ``include_exhausted=False`` drops cycles that already hit the empty-attempt
+        cap (used by scheduled polls so they do not refetch a month every poll).
         """
-        self._reconcile_hourly_completion_flags()
+        days = self._electric_interval_days()
+        self._reconcile_hourly_completion_flags(days)
         backfill = self._state.get("backfill", {}) or {}
         completed = set(backfill.get("completed_cycles", []) or [])
         pending: list[BillingCycle] = []
         for key in sorted(completed, reverse=True):
-            try:
-                start_s, end_s = key.split("|")
-                cycle = BillingCycle(
-                    start=date.fromisoformat(start_s), end=date.fromisoformat(end_s)
-                )
-            except ValueError:
+            cycle = self._cycle_from_key(key)
+            if cycle is None or self._cycle_has_hourly_data(cycle, days):
                 continue
-            if not self._cycle_has_hourly_data(cycle):
-                pending.append(cycle)
+            if not include_exhausted and self._hourly_exhausted(key):
+                continue
+            pending.append(cycle)
         return pending
 
-    async def _process_hourly_only_backfill(self, overwrite: bool) -> bool:
-        """Backfill intervals for one pending cycle; return False if none pending."""
-        pending = self._pending_hourly_cycles()
+    async def _process_hourly_only_backfill(
+        self, overwrite: bool, *, include_exhausted: bool = True
+    ) -> bool:
+        """Backfill intervals for one pending cycle; return False if none pending.
+
+        Picks the pending cycle with the fewest empty attempts (newest first on
+        ties) so one unfillable cycle cannot block every later press.
+        """
+        pending = self._pending_hourly_cycles(include_exhausted=include_exhausted)
         if not pending:
             return False
-        cycle = pending[0]
+        attempts = self._state["backfill"].get("hourly_empty_attempts") or {}
+        cycle = min(pending, key=lambda c: int(attempts.get(c.key, 0)))
         _LOGGER.info(
             "Backfill: daily cycles complete; filling hourly intervals for %s (%s pending)",
             cycle.key,
@@ -2368,6 +2493,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         overwrite: bool,
         cycle_key: str | None = None,
         allow_initialize_missing: bool = True,
+        retry_exhausted_hourly: bool = True,
     ) -> None:
         """Process one backfill cycle: daily + hourly intervals + monthly.
 
@@ -2376,6 +2502,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         initialization; manual service/button invocations will pass
         allow_initialize_missing=False so they can early-exit when there are no
         incomplete cycles to process.
+        retry_exhausted_hourly=False skips hourly-pending cycles that already hit
+        the empty-attempt cap (scheduled polls); manual runs keep retrying them.
         """
         if allow_initialize_missing:
             self._initialize_backfill_cycles()
@@ -2383,7 +2511,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             backfill_state = self._state.get("backfill", {})
             missing = backfill_state.get("missing_cycles", []) if isinstance(backfill_state, dict) else []
             if not missing and not cycle_key:
-                if await self._process_hourly_only_backfill(overwrite):
+                if await self._process_hourly_only_backfill(
+                    overwrite, include_exhausted=retry_exhausted_hourly
+                ):
                     return
                 _LOGGER.warning(
                     "Manual backfill requested but no incomplete backfill cycles to process for entry=%s",
@@ -2393,7 +2523,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
         cycle = self._pick_cycle_for_backfill(overwrite=overwrite, cycle_key=cycle_key)
         if cycle is None:
-            if not await self._process_hourly_only_backfill(overwrite):
+            if not await self._process_hourly_only_backfill(
+                overwrite, include_exhausted=retry_exhausted_hourly
+            ):
                 _LOGGER.debug("Backfill skipped: no eligible cycle (overwrite=%s)", overwrite)
             return
 
@@ -2733,7 +2865,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         # Always regenerate from current target (don't return early if cycles exist)
         # This ensures that when user updates target or config is refreshed,
         # the cycle list is regenerated and old/stale cycles are replaced
-        cycles = self._build_recent_monthly_cycles(now_date=datetime.now().date(), target=target)
+        # Same utility-calendar "today" as backfill_summary, so a UTC host cannot
+        # queue the still-open month (or drop the just-closed one) at month end.
+        cycles = self._build_recent_monthly_cycles(now_date=self._utility_today(), target=target)
         eligible_keys = [cycle.key for cycle in cycles]
         completed = set(backfill.get("completed_cycles", []))
 

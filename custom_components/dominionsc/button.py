@@ -74,10 +74,10 @@ class DominionSCBackfillButton(CoordinatorEntity[DominionSCCoordinator], ButtonE
 
 
 class DominionSCElectricityCatchupButton(CoordinatorEntity[DominionSCCoordinator], ButtonEntity):
-    """Button to sync electricity from install date to now (no deep re-backfill)."""
+    """Button to sync electricity for the open billing cycle (daily + hourly)."""
 
     _attr_has_entity_name = True
-    _attr_name = "Sync Electricity Since Install"
+    _attr_name = "Sync Current Cycle"
     _attr_icon = "mdi:flash-clock"
 
     def __init__(self, coordinator: DominionSCCoordinator, entry: ConfigEntry) -> None:
@@ -93,14 +93,11 @@ class DominionSCElectricityCatchupButton(CoordinatorEntity[DominionSCCoordinator
         )
 
     async def async_press(self) -> None:
-        """Trigger install→now electricity catch-up."""
+        """Trigger current-billing-cycle electricity sync."""
         await self.hass.services.async_call(
             DOMAIN,
             SERVICE_SYNC_ELECTRICITY_CATCHUP,
-            {
-                ATTR_CONFIG_ENTRY_ID: self._entry_id,
-                "full_since_install": True,
-            },
+            {ATTR_CONFIG_ENTRY_ID: self._entry_id},
             blocking=True,
         )
 

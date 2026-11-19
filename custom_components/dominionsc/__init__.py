@@ -70,7 +70,6 @@ CATCHUP_SERVICE_SCHEMA = (
     vol.Schema(
         {
             vol.Optional(ATTR_CONFIG_ENTRY_ID): cv.string,
-            vol.Optional("full_since_install", default=True): cv.boolean,
         }
     )
     if vol is not None and cv is not None
@@ -254,17 +253,14 @@ async def _async_handle_rewrite_statistics_service(hass, call) -> None:
 
 
 async def _async_handle_electricity_catchup_service(hass, call) -> None:
-    """Handle sync_electricity_catchup for one or all config entries."""
+    """Handle sync_electricity_catchup (sync current cycle) for one or all entries."""
     from .coordinator import DominionSCCoordinator
 
     target_entry_id = call.data.get(ATTR_CONFIG_ENTRY_ID)
-    full_since_install = bool(call.data.get("full_since_install", True))
 
     entries = hass.data.get(DOMAIN, {})
     for entry_id, runtime in entries.items():
         if target_entry_id and entry_id != target_entry_id:
             continue
         coordinator: DominionSCCoordinator = runtime[COORDINATOR]
-        await coordinator.async_sync_electricity_catchup(
-            full_since_install=full_since_install
-        )
+        await coordinator.async_sync_current_cycle()

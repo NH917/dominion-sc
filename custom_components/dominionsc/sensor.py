@@ -287,6 +287,9 @@ class DominionSCBackfillCyclesSensor(CoordinatorEntity[DominionSCCoordinator], S
             "completed_cycles": completed_labels,
             "incomplete_cycles": incomplete_labels,
             "pending_hourly_cycles": pending_hourly_labels,
+            "hourly_exhausted_cycles": [
+                _format_cycle_label(c) for c in summary.get("hourly_exhausted_cycles", [])
+            ],
         }
 
 
@@ -343,6 +346,10 @@ class DominionSCBackfillRemainingSensor(CoordinatorEntity[DominionSCCoordinator]
             ],
             "remaining_cycles": [
                 _format_cycle_label(c) for c in summary.get("remaining_cycles", [])
+            ],
+            "hourly_exhausted_count": len(summary.get("hourly_exhausted_cycles", [])),
+            "hourly_exhausted_cycles": [
+                _format_cycle_label(c) for c in summary.get("hourly_exhausted_cycles", [])
             ],
         }
 

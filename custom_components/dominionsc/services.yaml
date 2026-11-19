@@ -47,10 +47,10 @@ run_backfill_all:
         boolean:
 
 sync_electricity_catchup:
-  name: Sync electricity since install
+  name: Sync current cycle
   description: >
-    Fill electricity usage/cost from the integration install date (or catch-up
-    watermark) to now. Does not re-run deep historical billing-cycle backfill.
+    Fill electricity usage/cost for the open billing cycle (daily rows and
+    hourly intervals through today). Does not re-run deep historical backfill.
   fields:
     config_entry_id:
       name: Config entry ID
@@ -58,15 +58,6 @@ sync_electricity_catchup:
       required: false
       selector:
         text:
-    full_since_install:
-      name: Full since install
-      description: >
-        When true (default), refill from the original install date to today.
-        When false, only catch up from the last daily watermark (minus lookback).
-      required: false
-      default: true
-      selector:
-        boolean:
 
 rewrite_statistics:
   name: Rewrite statistics

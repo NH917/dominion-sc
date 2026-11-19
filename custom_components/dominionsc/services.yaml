@@ -1,6 +1,8 @@
 run_backfill:
   name: Run backfill
-  description: Process one billing cycle backfill for Dominion SC totals.
+  description: >
+    Process one billing cycle backfill — daily usage/cost, hourly intervals,
+    and monthly buckets — then refresh Energy external statistics.
   fields:
     config_entry_id:
       name: Config entry ID
@@ -26,7 +28,9 @@ run_backfill:
 
 run_backfill_all:
   name: Run backfill for all incomplete cycles
-  description: Process all incomplete billing cycle backfills for Dominion SC totals.
+  description: >
+    Process all incomplete billing cycles (daily + hourly + monthly) and refresh
+    Energy external statistics.
   fields:
     config_entry_id:
       name: Config entry ID

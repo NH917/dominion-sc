@@ -349,9 +349,10 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         await self._process_backfill(
             overwrite=overwrite, cycle_key=cycle_key, allow_initialize_missing=allow_initialize_missing
         )
-        await self._sync_external_statistics(force_rewrite=overwrite)
-        await self._sync_hourly_external_statistics(force_rewrite=overwrite)
-        await self._sync_monthly_external_statistics(force_rewrite=overwrite)
+        # Always rewrite hourly/monthly after backfill so Energy picks up new series.
+        await self._sync_external_statistics(force_rewrite=True)
+        await self._sync_hourly_external_statistics(force_rewrite=True)
+        await self._sync_monthly_external_statistics(force_rewrite=True)
         self._apply_monotonic_guard()
         # Update last_sync because a manual backfill is a successful sync operation
         self._set_last_sync()
@@ -383,9 +384,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         while self._state["backfill"].get("missing_cycles"):
             await self._process_backfill(overwrite=overwrite, allow_initialize_missing=False)
 
-        await self._sync_external_statistics(force_rewrite=overwrite)
-        await self._sync_hourly_external_statistics(force_rewrite=overwrite)
-        await self._sync_monthly_external_statistics(force_rewrite=overwrite)
+        await self._sync_external_statistics(force_rewrite=True)
+        await self._sync_hourly_external_statistics(force_rewrite=True)
+        await self._sync_monthly_external_statistics(force_rewrite=True)
         self._apply_monotonic_guard()
         self._set_last_sync()
         await self._save_state()
@@ -2121,13 +2122,45 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             _upsert(row)
         return [merged[key] for key in sorted(merged.keys())]
 
+    async def _backfill_hourly_and_monthly_for_cycle(
+        self,
+        cycle: BillingCycle,
+        *,
+        overwrite: bool,
+    ) -> None:
+        """Fetch Bidgely intervals + monthly buckets covering one billing cycle."""
+        utility_tz = self._local_tz()
+        start_dt = datetime.combine(cycle.start, time.min, tzinfo=utility_tz)
+        end_dt = datetime.combine(cycle.end, time.max, tzinfo=utility_tz)
+        try:
+            await self._store_interval_window(
+                start_dt,
+                end_dt,
+                electric_only=False,
+                overwrite=overwrite,
+            )
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning(
+                "Backfill hourly intervals failed for cycle %s: %s",
+                cycle.key,
+                err,
+            )
+        try:
+            await self._monthly_reconcile()
+        except Exception as err:  # pylint: disable=broad-except
+            _LOGGER.warning(
+                "Backfill monthly reconcile failed for cycle %s: %s",
+                cycle.key,
+                err,
+            )
+
     async def _process_backfill(
         self,
         overwrite: bool,
         cycle_key: str | None = None,
         allow_initialize_missing: bool = True,
     ) -> None:
-        """Process a backfill cycle.
+        """Process one backfill cycle: daily + hourly intervals + monthly.
 
         allow_initialize_missing controls whether the missing_cycles list may be
         lazily repopulated when empty. Scheduled automatic updates should allow
@@ -2231,6 +2264,9 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             self._upsert_daily(f"gas|{day_key}", g_ft3, overwrite, TOTAL_GAS_FT3)
             self._upsert_daily_cost(f"gas|{day_key}", g_cost, overwrite, TOTAL_GAS_COST)
 
+        # Also fill hourly (mode=day intervals) and monthly for this cycle window.
+        await self._backfill_hourly_and_monthly_for_cycle(cycle, overwrite=overwrite)
+
         backfill = self._state["backfill"]
         if cycle.key in backfill["missing_cycles"]:
             backfill["missing_cycles"].remove(cycle.key)
@@ -2239,8 +2275,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             backfill["cycles_completed"] += 1
         # Clear empty-attempt counter on success
         self._state.setdefault("backfill_empty_attempts", {}).pop(cycle.key, None)
-        _LOGGER.debug(
-            "Backfill cycle complete: %s cycles_completed=%s missing_remaining=%s",
+        _LOGGER.info(
+            "Backfill cycle complete: %s daily+hourly+monthly cycles_completed=%s missing_remaining=%s",
             cycle.key,
             backfill["cycles_completed"],
             len(backfill["missing_cycles"]),

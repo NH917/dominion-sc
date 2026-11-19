@@ -36,7 +36,7 @@ async def async_setup_entry(
 
 
 class DominionSCBackfillButton(CoordinatorEntity[DominionSCCoordinator], ButtonEntity):
-    """Button to run one backfill cycle via integration service."""
+    """Button to backfill one billing cycle (daily + hourly + monthly)."""
 
     _attr_has_entity_name = True
     _attr_name = "Run Backfill"

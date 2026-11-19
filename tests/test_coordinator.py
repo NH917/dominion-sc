@@ -193,6 +193,7 @@ async def test_process_backfill_applies_rows(monkeypatch):
     coord = sc_coordinator.DominionSCCoordinator(hass=None, entry=entry)
     cycle_key = "2026-01-01|2026-01-03"
     coord._state["backfill"]["missing_cycles"] = [cycle_key]
+    granular = {"hourly_monthly": 0}
 
     # mock _fetch_daily_rows to return a small set of rows for the cycle
     async def fake_fetch(start, end):
@@ -201,7 +202,13 @@ async def test_process_backfill_applies_rows(monkeypatch):
             {"date": "2026-01-02", "electric_usage_kwh": 2.0, "gas_usage_ccf": 0.0, "electric_cost": 1.0, "gas_cost": 0.0},
         ]
 
+    async def fake_hourly_monthly(cycle, *, overwrite):
+        granular["hourly_monthly"] += 1
+        assert cycle.key == cycle_key
+        assert overwrite is False
+
     monkeypatch.setattr(coord, "_fetch_daily_rows", fake_fetch)
+    monkeypatch.setattr(coord, "_backfill_hourly_and_monthly_for_cycle", fake_hourly_monthly)
 
     # process the explicit cycle
     await coord._process_backfill(overwrite=False, cycle_key=None, allow_initialize_missing=False)
@@ -210,6 +217,7 @@ async def test_process_backfill_applies_rows(monkeypatch):
     assert coord._state["daily_ledger"]["electric|2026-01-01"] == 1.0
     assert coord._state["daily_ledger"]["electric|2026-01-02"] == 2.0
     assert coord._state["daily_cost_ledger"]["electric|2026-01-01"] == 0.5
+    assert granular["hourly_monthly"] == 1
     # backfill state updated: missing removed and completed appended
     assert cycle_key not in coord._state["backfill"]["missing_cycles"]
     assert cycle_key in coord._state["backfill"]["completed_cycles"]
@@ -239,7 +247,13 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
         processed.append(current)
 
     async def fake_sync_external_statistics(force_rewrite):
-        processed.append("sync")
+        processed.append("sync_daily")
+
+    async def fake_sync_hourly(force_rewrite):
+        processed.append("sync_hourly")
+
+    async def fake_sync_monthly(force_rewrite):
+        processed.append("sync_monthly")
 
     async def fake_save_state():
         pass
@@ -247,6 +261,8 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
     monkeypatch.setattr(coord, "_ensure_authenticated", fake_ensure_authenticated)
     monkeypatch.setattr(coord, "_process_backfill", fake_process_backfill)
     monkeypatch.setattr(coord, "_sync_external_statistics", fake_sync_external_statistics)
+    monkeypatch.setattr(coord, "_sync_hourly_external_statistics", fake_sync_hourly)
+    monkeypatch.setattr(coord, "_sync_monthly_external_statistics", fake_sync_monthly)
     monkeypatch.setattr(coord, "_save_state", fake_save_state)
 
     await coord.async_run_backfill_all(overwrite=False)
@@ -254,7 +270,9 @@ async def test_async_run_backfill_all_processes_all_missing(monkeypatch):
     assert processed == [
         "2026-01-01|2026-01-02",
         "2026-02-01|2026-02-02",
-        "sync",
+        "sync_daily",
+        "sync_hourly",
+        "sync_monthly",
     ]
     assert coord._state["backfill"]["missing_cycles"] == []
     assert coord._state["backfill"]["completed_cycles"] == [

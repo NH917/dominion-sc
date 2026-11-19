@@ -272,20 +272,26 @@ class DominionSCBackfillCyclesSensor(CoordinatorEntity[DominionSCCoordinator], S
 
     @property
     def extra_state_attributes(self) -> dict[str, Any]:
-        """Return completed/incomplete counts and cycle lists as YYYY-MMM."""
+        """Return completed/incomplete/hourly-pending counts and cycle lists."""
         summary = self.coordinator.backfill_summary
         completed_labels = [_format_cycle_label(c) for c in summary["completed_cycles"]]
         incomplete_labels = [_format_cycle_label(c) for c in summary["incomplete_cycles"]]
+        pending_hourly_labels = [
+            _format_cycle_label(c) for c in summary.get("pending_hourly_cycles", [])
+        ]
         return {
             "completed_count": len(summary["completed_cycles"]),
             "incomplete_count": len(summary["incomplete_cycles"]),
+            "pending_hourly_count": len(summary.get("pending_hourly_cycles", [])),
+            "remaining_count": len(summary.get("remaining_cycles", summary["incomplete_cycles"])),
             "completed_cycles": completed_labels,
             "incomplete_cycles": incomplete_labels,
+            "pending_hourly_cycles": pending_hourly_labels,
         }
 
 
 class DominionSCBackfillRemainingSensor(CoordinatorEntity[DominionSCCoordinator], SensorEntity):
-    """Sensor exposing the number of backfill cycles remaining (incomplete_count).
+    """Sensor exposing remaining backfill work (daily incomplete + pending hourly).
 
     This sensor's state is an integer count so it appears directly on the
     integration's device overview page.
@@ -310,9 +316,35 @@ class DominionSCBackfillRemainingSensor(CoordinatorEntity[DominionSCCoordinator]
 
     @property
     def native_value(self) -> int | None:
-        """Return count of incomplete (missing) backfill cycles or None if unavailable."""
+        """Return remaining daily + hourly backfill cycles, or None if unavailable."""
+        # Prefer live count from coordinator (also published in coordinator.data).
+        if hasattr(self.coordinator, "backfill_remaining_count"):
+            return int(self.coordinator.backfill_remaining_count)
+        data = getattr(self.coordinator, "data", None)
+        if isinstance(data, dict) and "backfill_remaining" in data:
+            return int(data["backfill_remaining"])
         summary = self.coordinator.backfill_summary
-        return len(summary.get("incomplete_cycles", [])) if summary is not None else None
+        if summary is None:
+            return None
+        remaining = summary.get("remaining_cycles")
+        if remaining is not None:
+            return len(remaining)
+        return len(summary.get("incomplete_cycles", []))
+
+    @property
+    def extra_state_attributes(self) -> dict[str, Any]:
+        """Break out daily-incomplete vs hourly-pending work."""
+        summary = self.coordinator.backfill_summary
+        return {
+            "daily_incomplete_count": len(summary.get("incomplete_cycles", [])),
+            "pending_hourly_count": len(summary.get("pending_hourly_cycles", [])),
+            "pending_hourly_cycles": [
+                _format_cycle_label(c) for c in summary.get("pending_hourly_cycles", [])
+            ],
+            "remaining_cycles": [
+                _format_cycle_label(c) for c in summary.get("remaining_cycles", [])
+            ],
+        }
 
 class DominionSCCurrentBillingCycleSensor(CoordinatorEntity[DominionSCCoordinator], SensorEntity):
     """Current billing cycle formatted as 'MMM D - MMM D' (e.g., 'Mar 9 - Apr 4')."""

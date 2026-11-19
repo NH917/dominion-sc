@@ -199,6 +199,21 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             )
         )
 
+    def _publish_coordinator_data(self) -> None:
+        """Push totals + backfill remaining so diagnostic sensors always refresh."""
+        payload = dict(self.totals)
+        payload["backfill_remaining"] = self.backfill_remaining_count
+        payload["backfill_pending_hourly"] = len(self._pending_hourly_cycles())
+        try:
+            self.async_set_updated_data(payload)
+        except Exception:  # pylint: disable=broad-except
+            _LOGGER.debug("Could not publish coordinator data", exc_info=True)
+
+    @property
+    def backfill_remaining_count(self) -> int:
+        """Daily-incomplete + hourly-pending cycle count for the Remaining sensor."""
+        return len(self.backfill_summary.get("remaining_cycles", []))
+
     @property
     def backfill_summary(self) -> dict[str, Any]:
         """Compute a consistent backfill summary based on current target.
@@ -206,19 +221,29 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         Returns a dict with:
         - target: configured backfill cycles target
         - eligible_keys: cycle keys eligible for the current target
-        - completed_cycles: all-time completed cycle keys (persistent)
-        - completed_in_scope: completed cycles that are in the current eligible set
-        - incomplete_cycles: eligible cycles that are NOT yet completed
+        - completed_cycles: all-time completed daily cycle keys (persistent)
+        - completed_in_scope: completed daily cycles in the current eligible set
+        - incomplete_cycles: eligible daily cycles not yet completed
+        - pending_hourly_cycles: daily-complete cycles still missing hourly intervals
+        - remaining_cycles: daily incomplete + pending hourly (what the Remaining sensor shows)
         """
+        self._reconcile_hourly_completion_flags()
         target = self.backfill_cycles_target
         eligible = self._build_recent_monthly_cycles(
-            now_date=datetime.now().date(), target=target
+            now_date=self._utility_today(), target=target
         )
         eligible_keys = [c.key for c in eligible]
         all_completed = set(self.backfill.get("completed_cycles", []))
 
         completed_in_scope = [k for k in eligible_keys if k in all_completed]
         incomplete = [k for k in eligible_keys if k not in all_completed]
+        # Newest-first pending hourly from ledger coverage (not just a sticky flag).
+        pending_hourly = [c.key for c in self._pending_hourly_cycles()]
+        # Remaining work: unfinished daily cycles + daily-done cycles awaiting hourly.
+        # These sets are disjoint (hourly pending requires daily completed).
+        remaining = list(incomplete) + [
+            k for k in pending_hourly if k not in incomplete
+        ]
 
         return {
             "target": target,
@@ -226,6 +251,8 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             "completed_cycles": sorted(all_completed),
             "completed_in_scope": completed_in_scope,
             "incomplete_cycles": incomplete,
+            "pending_hourly_cycles": pending_hourly,
+            "remaining_cycles": remaining,
         }
 
     @property
@@ -362,8 +389,13 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         # Update last_sync because a manual backfill is a successful sync operation
         self._set_last_sync()
         await self._save_state()
-        self.async_set_updated_data(dict(self.totals))
-        _LOGGER.debug("Manual backfill finished: entry=%s totals=%s", self.config_entry.entry_id, self.totals)
+        self._publish_coordinator_data()
+        _LOGGER.info(
+            "Manual backfill finished: entry=%s remaining=%s pending_hourly=%s",
+            self.config_entry.entry_id,
+            self.backfill_remaining_count,
+            len(self._pending_hourly_cycles()),
+        )
 
     async def async_run_backfill_all(self, overwrite: bool = False) -> None:
         """Manually process all incomplete backfill cycles."""
@@ -398,8 +430,13 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         self._apply_monotonic_guard()
         self._set_last_sync()
         await self._save_state()
-        self.async_set_updated_data(dict(self.totals))
-        _LOGGER.debug("Manual full backfill finished: entry=%s totals=%s", self.config_entry.entry_id, self.totals)
+        self._publish_coordinator_data()
+        _LOGGER.info(
+            "Manual full backfill finished: entry=%s remaining=%s pending_hourly=%s",
+            self.config_entry.entry_id,
+            self.backfill_remaining_count,
+            len(self._pending_hourly_cycles()),
+        )
 
     async def async_rewrite_statistics(self) -> None:
         """Rebuild recorder-backed sensor statistics and clean legacy external series."""
@@ -2179,14 +2216,18 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
     ) -> int:
         """Fill interval_ledger for one cycle and track hourly completion.
 
-        A cycle counts as hourly-complete once any positive electric interval is
-        found, or after repeated empty attempts (Bidgely interval retention is
-        shorter than daily retention, so very old cycles may never return rows).
+        A cycle is hourly-complete only while interval_ledger holds positive
+        electric intervals inside it. Empty fetches count toward
+        ``_HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS`` but never complete the cycle:
+        exhausted cycles stay pending (reported as ``hourly_exhausted_cycles``)
+        because Bidgely interval retention is shorter than daily retention.
+        Fetch errors are not counted as empty attempts.
         """
         utility_tz = self._local_tz()
         start_dt = datetime.combine(cycle.start, time.min, tzinfo=utility_tz)
         end_dt = datetime.combine(cycle.end, time.max, tzinfo=utility_tz)
         positive = 0
+        failed = False
         try:
             positive = await self._store_interval_window(
                 start_dt,
@@ -2195,6 +2236,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
                 overwrite=overwrite,
             )
         except Exception as err:  # pylint: disable=broad-except
+            failed = True
             _LOGGER.warning(
                 "Backfill hourly intervals failed for cycle %s: %s",
                 cycle.key,
@@ -2205,7 +2247,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         backfill = self._state["backfill"]
         hourly_completed = backfill.setdefault("hourly_completed_cycles", [])
         attempts = backfill.setdefault("hourly_empty_attempts", {})
-        if positive > 0:
+        if positive > 0 or self._cycle_has_hourly_data(cycle):
             attempts.pop(cycle.key, None)
             if cycle.key not in hourly_completed:
                 hourly_completed.append(cycle.key)
@@ -2218,34 +2260,93 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
         attempt_n = int(attempts.get(cycle.key, 0)) + 1
         attempts[cycle.key] = attempt_n
+        # Never mark hourly-complete on empty fetches — remaining must stay > 0
+        # until interval data is actually in the ledger. Drop any stale flag.
+        if cycle.key in hourly_completed:
+            hourly_completed.remove(cycle.key)
         _LOGGER.warning(
-            "Backfill hourly cycle %s returned no electric intervals (attempt %s/%s)",
+            "Backfill hourly cycle %s returned no electric intervals (attempt %s); "
+            "leaving pending so Remaining stays accurate",
             cycle.key,
             attempt_n,
-            _HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS,
         )
-        if attempt_n >= _HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS and cycle.key not in hourly_completed:
-            hourly_completed.append(cycle.key)
         return 0
 
-    def _pending_hourly_cycles(self) -> list[BillingCycle]:
-        """Daily-complete cycles whose interval (hourly) backfill has not succeeded.
+    def _cycle_has_hourly_data(self, cycle: BillingCycle) -> bool:
+        """True when interval_ledger has any positive electric row in the cycle."""
+        ledger = self._state.get("interval_ledger", {}) or {}
+        for key, value in ledger.items():
+            if not isinstance(key, str) or not key.startswith("electric|"):
+                continue
+            try:
+                if float(value or 0.0) <= 0.0:
+                    continue
+            except (TypeError, ValueError):
+                continue
+            interval_end = key.split("|", 1)[1]
+            parsed = self._parse_interval_end_datetime(interval_end)
+            if parsed is None:
+                continue
+            day = parsed.date()
+            if (
+                parsed.hour == 0
+                and parsed.minute == 0
+                and parsed.second == 0
+                and parsed.microsecond == 0
+            ):
+                day = day - timedelta(days=1)
+            if cycle.start <= day <= cycle.end:
+                return True
+        return False
 
-        Covers cycles completed before hourly backfill existed. Newest first so
-        the Energy hourly series fills in from the most recent history.
-        """
-        backfill = self._state.get("backfill", {}) or {}
-        completed = set(backfill.get("completed_cycles", []) or [])
-        hourly_done = set(backfill.get("hourly_completed_cycles", []) or [])
-        pending: list[BillingCycle] = []
-        for key in sorted(completed - hourly_done, reverse=True):
+    def _reconcile_hourly_completion_flags(self) -> None:
+        """Drop hourly_completed flags that have no interval ledger coverage."""
+        backfill = self._state.setdefault("backfill", {})
+        completed = backfill.get("completed_cycles", []) or []
+        hourly_completed = list(backfill.get("hourly_completed_cycles", []) or [])
+        if not hourly_completed:
+            return
+        kept: list[str] = []
+        for key in hourly_completed:
             try:
                 start_s, end_s = key.split("|")
-                pending.append(
-                    BillingCycle(start=date.fromisoformat(start_s), end=date.fromisoformat(end_s))
+                cycle = BillingCycle(
+                    start=date.fromisoformat(start_s), end=date.fromisoformat(end_s)
                 )
             except ValueError:
                 continue
+            if self._cycle_has_hourly_data(cycle):
+                kept.append(key)
+        if kept != hourly_completed:
+            backfill["hourly_completed_cycles"] = kept
+            _LOGGER.info(
+                "Reconciled hourly_completed_cycles: %s -> %s (dropped flags without ledger data)",
+                len(hourly_completed),
+                len(kept),
+            )
+        # Also ensure daily-complete cycles without coverage are not stuck "done".
+        _ = completed
+
+    def _pending_hourly_cycles(self) -> list[BillingCycle]:
+        """Daily-complete cycles that still lack hourly interval ledger data.
+
+        Uses the interval ledger as source of truth (not only a sticky flag), so
+        Remaining stays > 0 until hours are actually stored. Newest first.
+        """
+        self._reconcile_hourly_completion_flags()
+        backfill = self._state.get("backfill", {}) or {}
+        completed = set(backfill.get("completed_cycles", []) or [])
+        pending: list[BillingCycle] = []
+        for key in sorted(completed, reverse=True):
+            try:
+                start_s, end_s = key.split("|")
+                cycle = BillingCycle(
+                    start=date.fromisoformat(start_s), end=date.fromisoformat(end_s)
+                )
+            except ValueError:
+                continue
+            if not self._cycle_has_hourly_data(cycle):
+                pending.append(cycle)
         return pending
 
     async def _process_hourly_only_backfill(self, overwrite: bool) -> bool:

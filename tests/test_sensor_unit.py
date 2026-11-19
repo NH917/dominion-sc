@@ -166,6 +166,12 @@ def test_backfill_cycles_sensor_attributes_and_value():
     coord.backfill_summary = {
         "completed_cycles": ["2026-01-01|2026-01-31"],
         "incomplete_cycles": ["2026-02-01|2026-02-28", "2026-03-01|2026-03-31"],
+        "pending_hourly_cycles": ["2026-01-01|2026-01-31"],
+        "remaining_cycles": [
+            "2026-02-01|2026-02-28",
+            "2026-03-01|2026-03-31",
+            "2026-01-01|2026-01-31",
+        ],
     }
     entry = DummyEntry("entry1")
     s = sc_sensor.DominionSCBackfillCyclesSensor(coord, entry)
@@ -173,15 +179,26 @@ def test_backfill_cycles_sensor_attributes_and_value():
     attrs = s.extra_state_attributes
     assert attrs["completed_count"] == 1
     assert attrs["incomplete_count"] == 2
+    assert attrs["pending_hourly_count"] == 1
+    assert attrs["remaining_count"] == 3
     assert attrs["completed_cycles"][0] == "2026-Jan"
 
 
 def test_backfill_remaining_sensor_with_summary():
     coord = DummyCoordinator()
-    coord.backfill_summary = {"incomplete_cycles": ["a", "b", "c"]}
+    coord.backfill_remaining_count = 3
+    coord.backfill_summary = {
+        "incomplete_cycles": [],
+        "pending_hourly_cycles": ["a", "b", "c"],
+        "remaining_cycles": ["a", "b", "c"],
+    }
     entry = DummyEntry("entry2")
     s = sc_sensor.DominionSCBackfillRemainingSensor(coord, entry)
     assert s.native_value == 3
+    attrs = s.extra_state_attributes
+    assert attrs["daily_incomplete_count"] == 0
+    assert attrs["pending_hourly_count"] == 3
+    assert len(attrs["remaining_cycles"]) == 3
 
 
 def test_current_billing_cycle_sensor_and_attrs():

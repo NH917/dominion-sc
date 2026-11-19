@@ -951,6 +951,46 @@ def _hourly_rows(day: datetime.date, kwh: float = 0.5) -> list[dict]:
     return rows
 
 
+def test_backfill_summary_remaining_includes_pending_hourly():
+    """Remaining must not stay 0 when daily is done but hourly is still pending."""
+    coord = make_coordinator(None)
+    coord._state["backfill"]["missing_cycles"] = []
+    coord._state["backfill"]["completed_cycles"] = [
+        "2026-09-01|2026-09-30",
+        "2026-10-01|2026-10-31",
+    ]
+    # Stale flags alone must not hide pending work — ledger has no intervals yet.
+    coord._state["backfill"]["hourly_completed_cycles"] = [
+        "2026-09-01|2026-09-30",
+        "2026-10-01|2026-10-31",
+    ]
+    monkeypatch_eligible = [
+        sc_coordinator.BillingCycle(
+            start=datetime.date(2026, 9, 1), end=datetime.date(2026, 9, 30)
+        ),
+        sc_coordinator.BillingCycle(
+            start=datetime.date(2026, 10, 1), end=datetime.date(2026, 10, 31)
+        ),
+    ]
+
+    def fake_build(now_date, target):
+        return monkeypatch_eligible[:target]
+
+    coord._build_recent_monthly_cycles = fake_build  # type: ignore[method-assign]
+    summary = coord.backfill_summary
+    assert summary["incomplete_cycles"] == []
+    assert summary["pending_hourly_cycles"] == [
+        "2026-10-01|2026-10-31",
+        "2026-09-01|2026-09-30",
+    ]
+    assert len(summary["remaining_cycles"]) == 2
+    assert coord.backfill_remaining_count == 2
+
+    # After real interval data lands for October, remaining drops by one.
+    coord._state["interval_ledger"]["electric|2026-10-15 12:00:00"] = 1.5
+    assert coord.backfill_remaining_count == 1
+
+
 @pytest.mark.asyncio
 async def test_manual_backfill_fills_hourly_when_daily_cycles_already_complete(monkeypatch):
     """Cycles completed before hourly backfill existed must still get intervals."""
@@ -1000,21 +1040,26 @@ async def test_process_backfill_runs_hourly_even_when_daily_empty(monkeypatch):
 
 
 @pytest.mark.asyncio
-async def test_backfill_hourly_marks_complete_after_repeated_empty(monkeypatch):
+async def test_backfill_hourly_empty_keeps_pending_and_remaining(monkeypatch):
+    """Empty Bidgely responses must not clear Remaining (cycle stays pending)."""
     coord = make_coordinator(None)
     cycle = sc_coordinator.BillingCycle(
         start=datetime.date(2025, 1, 1), end=datetime.date(2025, 1, 31)
     )
+    coord._state["backfill"]["completed_cycles"] = [cycle.key]
+    coord._state["backfill"]["hourly_completed_cycles"] = [cycle.key]  # stale flag
 
     async def empty_store(start, end, *, electric_only, overwrite=False):
         return 0
 
     monkeypatch.setattr(coord, "_store_interval_window", empty_store)
-    for _ in range(sc_coordinator._HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS - 1):
+    for _ in range(sc_coordinator._HOURLY_BACKFILL_MAX_EMPTY_ATTEMPTS + 1):
         await coord._backfill_hourly_for_cycle(cycle, overwrite=False)
-        assert cycle.key not in coord._state["backfill"]["hourly_completed_cycles"]
-    await coord._backfill_hourly_for_cycle(cycle, overwrite=False)
-    assert cycle.key in coord._state["backfill"]["hourly_completed_cycles"]
+
+    # Stale complete flag is reconciled away; cycle stays pending without ledger data.
+    assert cycle.key not in coord._state["backfill"].get("hourly_completed_cycles", [])
+    assert any(c.key == cycle.key for c in coord._pending_hourly_cycles())
+    assert coord.backfill_remaining_count >= 1
 
 
 @pytest.mark.asyncio

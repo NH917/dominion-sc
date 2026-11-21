@@ -300,14 +300,49 @@ async def test_backfill_rejects_reentry_while_busy(monkeypatch):
     async def fake_unlocked(**kwargs):
         calls["n"] += 1
 
-    monkeypatch.setattr(coord, "_run_backfill_unlocked", fake_unlocked)
+    monkeypatch.setattr(coord, "_run_backfill_all_unlocked", fake_unlocked)
     assert coord._try_begin_backfill("holder") is True
-    await coord.async_run_backfill(overwrite=False)
+    await coord.async_run_backfill_all(overwrite=False)
     assert calls["n"] == 0  # rejected while busy
     assert coord.backfill_in_progress is True
     coord._end_backfill()
-    await coord.async_run_backfill(overwrite=False)
+    await coord.async_run_backfill_all(overwrite=False)
     assert calls["n"] == 1
+    assert coord.backfill_in_progress is False
+
+
+@pytest.mark.asyncio
+async def test_rewrite_and_catchup_share_busy_lock(monkeypatch):
+    entry = DummyEntry("busy2")
+    coord = sc_coordinator.DominionSCCoordinator(hass=None, entry=entry)
+    calls = {"rewrite": 0, "catchup": 0, "all": 0}
+
+    async def fake_rewrite():
+        calls["rewrite"] += 1
+
+    async def fake_catchup():
+        calls["catchup"] += 1
+
+    async def fake_all(**kwargs):
+        calls["all"] += 1
+
+    monkeypatch.setattr(coord, "_rewrite_statistics_unlocked", fake_rewrite)
+    monkeypatch.setattr(coord, "_sync_current_cycle_unlocked", fake_catchup)
+    monkeypatch.setattr(coord, "_run_backfill_all_unlocked", fake_all)
+
+    assert coord._try_begin_backfill("holder") is True
+    await coord.async_rewrite_statistics()
+    await coord.async_sync_current_cycle()
+    await coord.async_run_backfill_all()
+    assert calls == {"rewrite": 0, "catchup": 0, "all": 0}
+    assert coord.backfill_in_progress is True
+
+    coord._end_backfill()
+    await coord.async_rewrite_statistics()
+    assert calls["rewrite"] == 1
+    assert coord.backfill_in_progress is False
+    await coord.async_sync_current_cycle()
+    assert calls["catchup"] == 1
     assert coord.backfill_in_progress is False
 
 
@@ -800,7 +835,7 @@ async def test_sync_current_cycle(monkeypatch):
     assert seen["intervals"] == (
         datetime.date(2026, 3, 1),
         datetime.date(2026, 3, 10),
-        True,
+        False,  # Sync Current Cycle fills electric + gas intervals
         True,
     )
     assert coord._state["electric_catchup"]["watermark_date"] == "2026-03-10"
@@ -987,7 +1022,7 @@ async def test_maybe_run_initial_backfill_once(monkeypatch):
         return None
 
     monkeypatch.setattr(coord, "_run_backfill_all_unlocked", fake_backfill_all)
-    monkeypatch.setattr(coord, "async_sync_current_cycle", fake_sync_cycle)
+    monkeypatch.setattr(coord, "_sync_current_cycle_unlocked", fake_sync_cycle)
     monkeypatch.setattr(coord, "_save_state", fake_save)
 
     await coord.async_maybe_run_initial_backfill()
@@ -1175,7 +1210,7 @@ async def test_backfill_hourly_fetch_error_does_not_count_as_empty_attempt(monke
 
 @pytest.mark.asyncio
 async def test_exhausted_hourly_cycle_does_not_block_other_pending_cycles(monkeypatch):
-    """Run Backfill must move past an unfillable newest cycle to fill the others."""
+    """Backfill must move past an unfillable newest cycle to fill the others."""
     coord = make_coordinator(None)
     sep = "2026-09-01|2026-09-30"
     octo = "2026-10-01|2026-10-31"
@@ -1290,8 +1325,8 @@ async def test_fetch_interval_payload_raises_when_every_request_fails(monkeypatc
 
 
 @pytest.mark.asyncio
-async def test_manual_backfill_requeues_stale_missing_cycles(monkeypatch):
-    """Button must work the eligible−completed queue even if missing_cycles is stale."""
+async def test_manual_backfill_all_requeues_stale_missing_cycles(monkeypatch):
+    """Run Backfill All must work the eligible−completed queue even if missing_cycles is stale."""
     coord = make_coordinator(None)
     coord._state["backfill"]["missing_cycles"] = []
     seen: dict[str, object] = {}
@@ -1301,18 +1336,55 @@ async def test_manual_backfill_requeues_stale_missing_cycles(monkeypatch):
 
     async def fake_process(overwrite, cycle_key=None, allow_initialize_missing=False):
         seen["missing"] = list(coord._state["backfill"]["missing_cycles"])
+        # Drain so the while-loop in _run_backfill_all_unlocked exits.
+        coord._state["backfill"]["missing_cycles"] = []
 
     monkeypatch.setattr(coord, "_ensure_authenticated", noop)
     monkeypatch.setattr(coord, "_process_backfill", fake_process)
+    monkeypatch.setattr(coord, "_pending_hourly_cycles", lambda: [])
     monkeypatch.setattr(coord, "_sync_external_statistics", noop)
     monkeypatch.setattr(coord, "_sync_hourly_external_statistics", noop)
     monkeypatch.setattr(coord, "_sync_monthly_external_statistics", noop)
     monkeypatch.setattr(coord, "_save_state", noop)
     monkeypatch.setattr(coord, "_publish_coordinator_data", lambda: None)
 
-    await coord.async_run_backfill(overwrite=False)
+    await coord.async_run_backfill_all(overwrite=False)
     assert seen["missing"] == coord.backfill_summary["incomplete_cycles"]
     assert seen["missing"]
+
+
+def test_daily_lookback_cutoff_and_placeholder_semantics():
+    """Lookback is a lag window for zeros, not the daily-reconcile fetch range."""
+    entry = DummyEntry()
+    entry.options = {sc_coordinator.CONF_DAILY_LOOKBACK_DAYS: 5}
+    coord = sc_coordinator.DominionSCCoordinator(hass=None, entry=entry)
+    today = datetime.date(2026, 3, 15)
+
+    assert coord._daily_lookback_days() == 5
+    assert coord._daily_lookback_cutoff(today) == datetime.date(2026, 3, 10)
+
+    # Inside window, all-zero skipped; outside window kept for row-level skip.
+    inside = {
+        "date": "2026-03-12",
+        "electric_usage_kwh": 0,
+        "gas_usage_ccf": 0,
+        "electric_cost": 0,
+        "gas_cost": 0,
+    }
+    outside = {
+        "date": "2026-03-01",
+        "electric_usage_kwh": 0,
+        "gas_usage_ccf": 0,
+        "electric_cost": 0,
+        "gas_cost": 0,
+    }
+    assert coord._should_skip_daily_row(inside, today, is_backfill=False) is True
+    assert coord._should_skip_daily_row(outside, today, is_backfill=False) is False
+
+    # lookback=0 / negative clamps to 1 day
+    entry.options = {sc_coordinator.CONF_DAILY_LOOKBACK_DAYS: 0}
+    assert coord._daily_lookback_days() == 1
+    assert coord._daily_lookback_cutoff(today) == datetime.date(2026, 3, 14)
 
 
 @pytest.mark.asyncio

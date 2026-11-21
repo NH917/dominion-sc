@@ -387,7 +387,7 @@ class BidgelyClient:
         locale: str = "en_US",
         next_bill_cycle: bool = False,
         show_at_granularity: bool = False,
-        skip_ongoing_cycle: bool = True,
+        skip_ongoing_cycle: bool = False,
         extra_params: Optional[Dict[str, Any]] = None,
     ) -> JsonDict:
         """
@@ -490,6 +490,7 @@ class BidgelyClient:
             locale=locale,
             next_bill_cycle=False,
             show_at_granularity=False,
+            # current_cycle=True means INCLUDE the open cycle → skip_ongoing=False
             skip_ongoing_cycle=not current_cycle,
         )
 

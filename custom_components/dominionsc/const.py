@@ -29,7 +29,6 @@ DEFAULT_ENABLE_MONTHLY_STATISTICS = True
 # Cap hourly API catch-up window so button/daily runs do not hammer Bidgely.
 DEFAULT_CATCHUP_HOURLY_DAYS = 7
 
-SERVICE_RUN_BACKFILL = "run_backfill"
 SERVICE_RUN_BACKFILL_ALL = "run_backfill_all"
 SERVICE_REWRITE_STATISTICS = "rewrite_statistics"
 SERVICE_SYNC_ELECTRICITY_CATCHUP = "sync_electricity_catchup"

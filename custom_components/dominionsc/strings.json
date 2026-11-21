@@ -58,7 +58,7 @@
         "data_description": {
           "poll_minutes": "How often to poll Dominion for new data (in minutes).",
           "backfill_cycles_target": "Number of most recent completed billing cycles to backfill. Increasing this adds unfilled cycles to the backfill queue.",
-          "daily_lookback_days": "Number of days to look back during daily reconciliation to catch late-arriving data.",
+          "daily_lookback_days": "Recent days where zero API values are treated as late-arriving placeholders and skipped until real data appears. Daily reconcile still fetches the full open billing cycle.",
           "enable_hourly_statistics": "Publish Dominion SC Hourly usage/cost in Energy Dashboard (updates each completed hour).",
           "enable_daily_statistics": "Publish Dominion SC Daily usage/cost in Energy Dashboard (updates each completed hour for today; finalized days from Bidgely).",
           "enable_monthly_statistics": "Publish Dominion SC Monthly usage/cost in Energy Dashboard (updates after each month ends).",

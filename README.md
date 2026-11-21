@@ -8,14 +8,17 @@ A custom Home Assistant integration for **Dominion Energy South Carolina** that 
 
 - **Electric & Gas consumption** sensors with full historical backfill
 - **Electric & Gas cost** sensors
-- **Energy Dashboard compatible** — sensors use `total_increasing` / `total` state classes with correct units
-- **Historical statistics import** — backfilled data appears at the correct dates in long-term statistics
-- **Automatic incremental polling** — 15-minute interval data ingestion with deduplication
-- **Lag-tolerant daily reconciliation** — handles Dominion's ~2-day reporting delay
-- **Billing cycle backfill** — automatically fills one historical cycle per poll; configurable depth
+- **Energy Dashboard compatible** — external statistics for **Hourly**, **Daily**, and **Monthly** views
+- **Historical statistics import** — backfilled data appears at the correct local (Eastern) dates
+- **Automatic incremental polling** — interval data ingestion with deduplication
+- **Lag-tolerant daily reconciliation** — handles Dominion's reporting delay
+- **Billing cycle backfill** — daily + hourly + monthly per cycle; one cycle per poll, or Run Backfill All on demand
+- **One-time install backfill** — drains the historical queue once after setup, then syncs the open cycle
+- **Sync Current Cycle** — button/service to refresh the open billing period (daily + hourly through today)
 - **2FA support** — SMS and email verification during setup
 - **Persistent state** — survives restarts without data loss or double-counting
-- **Manual backfill & statistics rewrite** — UI buttons and services for on-demand control
+- **Busy-safe jobs** — backfill / sync / cleanup buttons are unavailable while any sync job is running
+- **Null-safe zeros** — placeholder / unknown zero rows are not written into ledgers or statistics
 
 ## ⚠️ Upgrade Notice — Energy Dashboard Reconfiguration Required
 
@@ -26,7 +29,7 @@ A custom Home Assistant integration for **Dominion Energy South Carolina** that 
 > **What to do:**
 > 1. Go to **Settings → Dashboards → Energy**
 > 2. Remove the existing Dominion consumption/cost entities from your grid configuration
-> 3. Re-add them by selecting the new external statistics (e.g. **"Dominion SC Electric"**, **"Dominion SC Gas"**, **"Dominion SC Electric Cost"**, **"Dominion SC Gas Cost"**)
+> 3. Re-add them by selecting the new external statistics (e.g. **"Dominion SC Daily Electric"**, **"Dominion SC Hourly Electric"**, **"Dominion SC Gas Cost"**)
 > 4. These appear under the "External statistics" section in the entity picker
 >
 > The new external statistics are not affected by HA's recorder auto-compilation and will not produce negative deltas after restarts.
@@ -54,7 +57,7 @@ This integration is designed for Home Assistant **2026.4.0** and later versions.
 - ConfigEntry and options flow for configuration
 - Store for persistent state management
 - SensorEntityDescription for sensor metadata
-- Long-term statistics integration with recorder
+- Long-term / external statistics integration with recorder
 
 ## Installation
 
@@ -89,11 +92,13 @@ This integration is designed for Home Assistant **2026.4.0** and later versions.
    - **Backfill cycles target** — how many previous billing cycles to backfill (default: `6`)
    - **Daily lookback days** — lag-tolerant reconciliation window (default: `5`)
 
+After the first successful refresh, the integration runs a **one-time historical backfill** (all incomplete cycles in the target window), then **Sync Current Cycle** for the open billing period.
+
 ## Entities
 
 After setup, the integration creates a **Dominion SC Energy** device with the following entities:
 
-### Energy Sensors (for Energy Dashboard)
+### Energy Sensors (live state)
 
 | Entity | Unit | State Class | Description |
 |--------|------|-------------|-------------|
@@ -102,19 +107,39 @@ After setup, the integration creates a **Dominion SC Energy** device with the fo
 | Electric Cumulative Cost | $ | `total` | Running total of electric cost |
 | Gas Cumulative Cost | $ | `total` | Running total of gas cost |
 
+Use these for live cards/automations. For the Energy Dashboard, prefer the **external statistics** below.
+
+### External statistics (Energy Dashboard)
+
+Published as `dominionsc:*` and shown in the Energy picker (when the matching option is enabled):
+
+| Name pattern | Granularity | Typical use |
+|--------------|-------------|-------------|
+| Dominion SC Hourly … | Hour | Energy Dashboard **Hour** view |
+| Dominion SC Daily … | Day | Energy Dashboard **Day** view |
+| Dominion SC Monthly … | Month | Energy Dashboard **Month** view |
+
+Series cover electric/gas consumption and cost. Day boundaries use **America/New_York** (Dominion Bidgely wall clock), not the HA host timezone.
+
 ### Diagnostic Sensors
 
 | Entity | State | Attributes | Description |
 |--------|-------|------------|-------------|
-| Backfill Cycles | Total cycle count | `completed_count`, `incomplete_count`, `completed_cycles` (YYYY-MMM list), `incomplete_cycles` (YYYY-MMM list) | Overview of backfill progress |
-| Current Billing Cycle | `MMM D - MMM D` (e.g. `Mar 9 - Apr 4`) | `start`, `end` (raw ISO dates) | Current billing period |
+| Backfill Cycles | Configured target | `completed_count`, `incomplete_count`, `pending_hourly_count`, `remaining_count`, cycle lists (`YYYY-MMM`) | Overview of backfill progress |
+| Backfill Cycles Remaining | Integer | `daily_incomplete_count`, `pending_hourly_count`, `pending_hourly_cycles`, `remaining_cycles`, `hourly_exhausted_*` | Work left: unfinished **daily** cycles **plus** daily-complete cycles still missing **hourly** data |
+| Current Billing Cycle | `MMM D - MMM D` (e.g. `Mar 9 - Apr 4`) | `start`, `end` (ISO dates) | Open billing period from bill projection / current usage |
+
+**Remaining** only drops when a cycle has daily data **and** real hourly interval coverage in the ledger. Empty Bidgely hourly responses do not mark a cycle done.
 
 ### Buttons
 
-| Entity | Description |
-|--------|-------------|
-| Run Backfill | Triggers one backfill cycle (append mode) |
-| Cleanup External Statistics | Clears legacy external statistics and force-rewrites all historical data |
+| Entity | Icon | Description |
+|--------|------|-------------|
+| Run Backfill All | `mdi:playlist-play` | Drains **all** incomplete cycles up to the configured backfill-cycles target (through current), then refreshes Energy statistics. |
+| Sync Current Cycle | `mdi:flash-clock` | Refreshes electric + gas for the **open billing cycle** (daily rows + hourly intervals through today). Does not re-run deep historical backfill. |
+| Cleanup External Statistics | `mdi:database-refresh` | Clears legacy/`dominionsc:*` external statistics and force-rewrites historical series from ledgers. |
+
+All three buttons are **unavailable** while any of these jobs (or the scheduled/initial backfill) is already running, so they cannot overlap or re-enter themselves.
 
 ### Account & Billing Informational Sensors
 
@@ -138,37 +163,35 @@ These sensors read Dominion's `account_summary`, `bill_projection`, and `current
 ## Energy Dashboard Configuration
 
 1. Go to **Settings → Dashboards → Energy**.
-2. Under **Electricity**:
-   - **Grid consumption**: select `Electric Cumulative Consumption`
-3. Under **Gas**:
-   - **Gas consumption**: select `Gas Cumulative Consumption`
+2. Under **Electricity** / **Gas**, add the Dominion **external statistics** (Hourly / Daily / Monthly as needed), for example:
+   - Grid consumption: **Dominion SC Daily Electric** or **Dominion SC Hourly Electric**
+   - Cost: matching **Dominion SC … Cost** series
+3. Ensure the matching options are enabled (**Enable hourly / daily / monthly statistics**) under Configure.
 
-> **Note:** After initial setup, it may take 5–10 minutes for the sensors to appear in the Energy Dashboard picker. The recorder needs at least one statistics compilation cycle.
+> **Note:** After initial setup or a fresh hourly import, it may take a few minutes for new series to appear in the Energy picker. Use **Sync Current Cycle** or **Run Backfill All** if Hourly is missing after install.
 
 ## Services
 
-### `dominionsc.run_backfill`
-
-Manually trigger a backfill cycle.
-
-| Parameter | Type | Default | Description |
-|-----------|------|---------|-------------|
-| `config_entry_id` | string | _(all entries)_ | Target a specific config entry |
-| `overwrite` | boolean | `false` | If `true`, re-imports the cycle and replaces prior stored values |
-| `allow_initialize_missing` | boolean | `false` | If `true`, allow the service to repopulate the internal `missing_cycles` list when empty (forces initialization). If `false` (default), manual calls will warn-and-exit when there are no incomplete cycles to process. |
-
 ### `dominionsc.run_backfill_all`
 
-Manually trigger all currently incomplete backfill cycles.
+Process **all** incomplete billing cycles (daily + hourly + monthly) and refresh Energy external statistics.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
 | `config_entry_id` | string | _(all entries)_ | Target a specific config entry |
 | `overwrite` | boolean | `false` | If `true`, re-imports all incomplete cycles and replaces prior stored values |
 
+### `dominionsc.sync_electricity_catchup`
+
+**Sync current cycle** — fill electricity usage/cost for the open billing cycle (daily rows and hourly intervals through today). Does not re-run deep historical backfill.
+
+| Parameter | Type | Default | Description |
+|-----------|------|---------|-------------|
+| `config_entry_id` | string | _(all entries)_ | Target a specific config entry |
+
 ### `dominionsc.rewrite_statistics`
 
-Clears legacy external statistics (`dominionsc:*` IDs) and force-rewrites all historical data into the recorder `sensor.*` statistics path.
+Clears legacy external statistics (`dominionsc:*` IDs) and force-rewrites historical series.
 
 | Parameter | Type | Default | Description |
 |-----------|------|---------|-------------|
@@ -179,13 +202,15 @@ Clears legacy external statistics (`dominionsc:*` IDs) and force-rewrites all hi
 ### Data Flow
 
 ```
-Dominion API
+Dominion / Bidgely API
     │
-    ├─ 15-min interval endpoint ──→ Interval ledger (dedupe by timestamp+fuel)
-    │                                    │
-    ├─ Daily usage endpoint ──────→ Daily ledger (upsert by date+fuel)
-    │                                    │
-    └─ Billing cycle backfill ────→ Daily ledger (one cycle per poll)
+    ├─ Interval (mode=day) ─────→ Interval ledger → Hourly external stats
+    │
+    ├─ Daily usage (mode=month) → Daily ledger → Daily external stats
+    │
+    ├─ Monthly (mode=year) ─────→ Monthly buckets → Monthly external stats
+    │
+    └─ Billing cycle backfill ──→ Daily + hourly + monthly for each cycle
                                          │
                                          ▼
                                   Synthetic cumulative totals
@@ -193,8 +218,8 @@ Dominion API
                                          │
                                     ┌────┴────┐
                                     ▼         ▼
-                              HA Sensors   Recorder LTS
-                              (live state)  (historical)
+                              HA Sensors   Recorder / Energy
+                              (live state)  (external LTS)
 ```
 
 ### Authentication
@@ -202,32 +227,43 @@ Dominion API
 - On first setup, the config flow handles login and optional 2FA.
 - Credentials are stored in the config entry.
 - The coordinator re-authenticates automatically on each poll using stored credentials.
+- Auth state stays in Home Assistant `ConfigEntry` / `Store` persistence — no cookie files on disk.
 - If a refreshed 2FA token is returned, it is persisted back to the config entry.
 
 ### Backfill Strategy
 
-- On each scheduled poll, the coordinator processes **at most one** missing billing cycle.
-- Cycles are processed oldest-first.
-- The **Run Backfill** button (or `run_backfill` service) can be pressed multiple times to accelerate backfill.
+- **Install:** one-time drain of all incomplete cycles in the target window, then Sync Current Cycle.
+- **Each scheduled poll:** at most **one** missing billing cycle (daily + hourly + monthly).
+- Cycles are processed oldest-first within the configured **Backfill cycles target**.
+- **Run Backfill All** drains every incomplete cycle in one press; it is disabled while busy.
+- **Backfill Cycles Remaining** counts daily-incomplete cycles **and** cycles that still need hourly interval data.
 - With `overwrite: true`, existing cycle data is replaced (useful for correcting stale data).
+- Empty hourly API responses leave the cycle pending (Remaining stays > 0) instead of marking it complete.
+
+### Catch-up / current cycle
+
+- **Sync Current Cycle** (button / `sync_electricity_catchup`) uses the open billing window from bill projection / current usage, clamped to today.
+- Optional **Daily electricity catch-up** (Configure) runs once per local day from the catch-up watermark (lookback window) without deep historical backfill.
+- Scheduled hourly/monthly catch-up commits completed hours and finished months into Energy series when enabled.
 
 ### Statistics Import
 
-- Historical data is imported into Home Assistant's long-term statistics at the correct day timestamps.
-- The integration uses `async_import_statistics` for initial/rewrite imports and `async_add_external_statistics` for append-only updates.
-- Future-dated placeholder rows (zero-value days beyond today) are automatically filtered out.
-- If newly backfilled days are older than previously imported days, the integration automatically triggers a full rewrite for that series to maintain cumulative sum continuity.
+- Historical data is imported into Home Assistant long-term / external statistics at Eastern local midnights (and hour ends for interval data).
+- The integration uses `async_import_statistics` / `async_add_external_statistics` (not awaitable despite the `async_` prefix) and `recorder.async_clear_statistics` for cleanup rewrites.
+- Future-dated placeholder rows (zero-value days beyond today) are filtered out.
+- If newly backfilled days are older than previously imported days, the integration triggers a full rewrite for that series to keep cumulative sums continuous.
 
 Additional import/filtering behavior
 
-- Recent days within the configured "daily lookback" window are ignored if Dominion returns only null/zero for both consumption and cost. These all-zero/null rows are considered placeholders and are skipped during daily reconciliation; the lag-safe lookback window will upsert their real values when Dominion supplies them a few days later.
-- For finalized/backfill cycles, zero electric consumption for a full day is treated as suspicious and is skipped (true zero electric for a full day is extremely unlikely); zero gas or zero cost on finalized days is trusted as valid.
-- Filtering is applied before ledger upsert and before building `StatisticData` for recorder import so that null values (which may be parsed as 0.0) do not create premature zero-value statistics.
+- Daily reconcile fetches the **full open billing cycle**. The configured **Daily lookback days** only marks recent zeros as late-arriving placeholders (skipped until real values arrive); it does not shrink the fetch window.
+- For finalized/backfill cycles, zero electric consumption for a full day is treated as suspicious and skipped; zero gas or zero cost on finalized days is trusted as valid.
+- Filtering runs before ledger upsert and before building `StatisticData`, so nulls parsed as `0.0` do not create premature zero-value statistics.
 
 ### Units & Conversion
 
 - **Electric**: reported in `kWh` (no conversion needed).
 - **Gas**: Dominion reports in `CCF`; converted to `ft³` (`CCF × 100`) for Home Assistant's gas device class.
+- Monetary sensors use `state_class=total` (not `total_increasing`).
 
 ## Debugging
 
@@ -242,8 +278,9 @@ logger:
 
 Then restart Home Assistant. Debug output covers:
 - Authentication state and token refresh
-- Backfill cycle selection and row counts
+- Backfill cycle selection, remaining/pending hourly, and row counts
 - Daily reconciliation window
+- Current-cycle sync ranges
 - Statistics sync (import counts, rewrite triggers, future-date filtering)
 - Future placeholder row skipping
 
@@ -272,27 +309,43 @@ period.
 After setup, you can adjust options via **Settings → Devices & Services → Dominion SC Energy → Configure**:
 
 - **Poll interval** (minutes)
-- **Backfill cycles target**
-- **Daily lookback days**
+- **Backfill cycles target** — raising this queues newly eligible incomplete cycles
+- **Daily lookback days** — lag-tolerance window for zero placeholders (default `5`); reconcile still covers the open billing cycle
+- **Enable hourly statistics** — publish Dominion SC Hourly series for Energy
+- **Enable daily statistics** — publish Dominion SC Daily series for Energy
+- **Enable monthly statistics** — publish Dominion SC Monthly series for Energy
+- **Daily electricity catch-up** — once per day, refresh from the catch-up watermark
 
-Changes take effect on the next poll cycle.
+Changes take effect on the next poll cycle (backfill target changes recalculate the missing queue immediately).
 
 ## Troubleshooting
 
 ### "No statistics available" in Energy Dashboard
 - Wait 5–10 minutes after initial setup for the recorder to compile statistics.
 - Verify the sensor state is not `unavailable` or `unknown`.
+- Confirm hourly/daily/monthly options are enabled, then press **Sync Current Cycle** or **Run Backfill All**.
+
+### Hourly missing from the Energy picker
+- Enable **Enable hourly statistics**.
+- Press **Sync Current Cycle** (open period) or **Run Backfill All** until **Backfill Cycles Remaining** reaches `0`.
+- Check attributes on Remaining for `pending_hourly_cycles`.
+
+### Remaining stays at 0 while hourly still looks incomplete
+- Reload the integration after updating. Remaining includes pending hourly work; empty API responses no longer mark hourly complete.
 
 ### "Verification code was not accepted"
 - Ensure you entered the code without leading/trailing spaces.
 - If the code was valid, this may indicate a post-auth session issue. Check HA logs for the actual error.
 
 ### Sensors show data only from today
-- Run the **Cleanup External Statistics** button to force-rewrite historical data into the recorder.
-- Verify backfill cycles have completed (check the diagnostic sensors).
+- Run **Cleanup External Statistics** to force-rewrite historical data.
+- Verify backfill cycles have completed (Backfill Cycles / Remaining diagnostics).
 
 ### Negative values in statistics
 - This can occur if backfill cycles were imported out of order. Run **Cleanup External Statistics** to rebuild the cumulative series.
+
+### Day bars appear one day ahead
+- Statistics use Eastern local midnight. After upgrading, reload once so any day-key migration can run; use Cleanup External Statistics if old UTC-aligned points remain.
 
 ## License
 

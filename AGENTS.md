@@ -20,7 +20,7 @@ Dashboard and long-term statistics.
   - `coordinator.py` — polling, daily reconciliation, backfill, statistics import (largest module, ~1488 lines)
   - `dominion_sc_client.py` / `bidgely_client.py` — blocking HTTP clients (Dominion + Bidgely)
   - `sensor.py` — energy + diagnostic + account/billing sensors
-  - `button.py` — Run Backfill / Cleanup External Statistics buttons
+  - `button.py` — Run Backfill All / Sync Current Cycle / Cleanup External Statistics buttons
   - `const.py`, `manifest.json`, `services.yaml`, `strings.json`, `translations/en.json`
 - `tests/` — unit tests (`test_coordinator.py`, `test_sensor_unit.py`); `conftest.py` injects
   lightweight HA/bs4 stubs into `sys.modules` so imports work without a full HA install

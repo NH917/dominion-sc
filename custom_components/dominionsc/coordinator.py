@@ -1671,7 +1671,7 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
 
         # Prefer finishing the one-time historical backfill before catch-up loops.
         if not self._state.get("initial_backfill_done"):
-            await self.async_maybe_run_initial_backfill()
+            self.hass.async_create_task(self.async_maybe_run_initial_backfill())
             return
 
         catchup = self._state.setdefault(

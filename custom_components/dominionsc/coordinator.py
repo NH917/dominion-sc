@@ -1466,11 +1466,16 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         for key, value in ledger.items():
             if not isinstance(key, str) or not key.startswith(f"{fuel_prefix}|"):
                 continue
-            interval_ts = key.split("|", 1)[1]
-            parsed = cls._parse_interval_end_datetime(interval_ts, tz=local_tz)
+            interval_end = key.split("|", 1)[1]
+            parsed = cls._parse_interval_end_datetime(interval_end, tz=local_tz)
             if parsed is None:
                 continue
-            hour_start = parsed.replace(minute=0, second=0, microsecond=0)
+            # Interval end belongs to the preceding hour bucket when exact hour.
+            # Example: 01:00:00 closes the 00:00 hour; 00:15 closes the 00:00 hour.
+            if parsed.minute == 0 and parsed.second == 0 and parsed.microsecond == 0:
+                hour_start = (parsed - timedelta(hours=1)).replace(minute=0, second=0, microsecond=0)
+            else:
+                hour_start = parsed.replace(minute=0, second=0, microsecond=0)
             buckets[hour_start] = buckets.get(hour_start, 0.0) + max(float(value or 0.0), 0.0)
 
         return sorted(buckets.items(), key=lambda item: item[0])
@@ -3000,30 +3005,25 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         for row in chart_rows:
             interval_start = row.get("intervalStartDate") or row.get("intervalStart")
             interval_end = row.get("intervalEndDate") or row.get("intervalEnd")
-            if interval_end in (None, "") and interval_start in (None, ""):
+            if interval_end in (None, ""):
                 continue
-
-            # Prefer interval_start if available so we never misinterpret start vs. end
-            raw_ts = interval_start if interval_start not in (None, "") else interval_end
-            parsed_ts = cls._parse_interval_end_datetime(raw_ts)
-            if parsed_ts is None:
+            parsed_end = cls._parse_interval_end_datetime(interval_end)
+            if parsed_end is None:
                 continue
-
-            # If we had to fall back to interval_end and it's on an exact hour,
-            # shift back 1 hour only if interval_start was missing.
-            if interval_start in (None, "") and (
-                parsed_ts.minute == 0 and parsed_ts.second == 0 and parsed_ts.microsecond == 0
-            ):
-                parsed_ts = parsed_ts - timedelta(hours=1)
-
-            interval_key_s = parsed_ts.strftime("%Y-%m-%d %H:%M:%S")
-            day_key = parsed_ts.date().isoformat()
+            # Normalize ledger keys to a parseable wall-clock string.
+            interval_end_s = parsed_end.strftime("%Y-%m-%d %H:%M:%S")
+            day_key = cls._day_key_from_bidgely_interval(
+                interval_start=interval_start,
+                interval_end=interval_end_s,
+            )
+            if not day_key:
+                continue
             consumption = cls._first_numeric(row, _USAGE_VALUE_KEYS)
             cost = cls._first_numeric(row, _COST_VALUE_KEYS)
 
             rows.append(
                 {
-                    "interval_end": interval_key_s,
+                    "interval_end": interval_end_s,
                     "date": day_key,
                     "electric_usage_kwh": consumption if fuel == "electric" else 0.0,
                     "gas_usage_ccf": consumption if fuel == "gas" else 0.0,

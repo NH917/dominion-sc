@@ -1334,13 +1334,19 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
         *,
         tz: ZoneInfo | None = None,
     ) -> datetime | None:
-        """Parse Bidgely intervalEndDate as utility-local wall clock (not UTC)."""
+        """Parse Bidgely intervalEndDate as utility-local wall clock."""
         local_tz = tz or _DEFAULT_UTILITY_TZ
         if isinstance(interval_end, (int, float)):
             ts = float(interval_end)
             if ts > 10**11:
                 ts /= 1000.0
-            return datetime.fromtimestamp(ts, tz=local_tz)
+            # Bidgely epoch timestamps for daily/monthly buckets are often UTC midnight
+            # (e.g. 2026-11-21 00:00:00Z). Converting straight to America/New_York
+            # shifts them to 19:00/20:00 the previous day.
+            dt_utc = datetime.fromtimestamp(ts, tz=UTC)
+            if dt_utc.hour == 0 and dt_utc.minute == 0 and dt_utc.second == 0:
+                return datetime.combine(dt_utc.date(), time.min, tzinfo=local_tz)
+            return dt_utc.astimezone(local_tz)
 
         text = str(interval_end).strip()
         if not text or text.lower() == "none":
@@ -1350,7 +1356,10 @@ class DominionSCCoordinator(DataUpdateCoordinator[dict[str, float]]):
             ts = int(text)
             if abs(ts) > 10**11:
                 ts //= 1000
-            return datetime.fromtimestamp(ts, tz=local_tz)
+            dt_utc = datetime.fromtimestamp(ts, tz=UTC)
+            if dt_utc.hour == 0 and dt_utc.minute == 0 and dt_utc.second == 0:
+                return datetime.combine(dt_utc.date(), time.min, tzinfo=local_tz)
+            return dt_utc.astimezone(local_tz)
         for fmt in ("%Y-%m-%d %H:%M:%S", "%Y-%m-%d %H:%M", "%Y-%m-%dT%H:%M:%S", "%Y-%m-%d"):
             try:
                 parsed = datetime.strptime(text, fmt)
